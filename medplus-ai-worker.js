@@ -1,6 +1,6 @@
 /**
  * MedPlus AI Pro - Cloudflare Worker
- * Version: 0.7.4
+ * Version: 0.8.0
  *
  * Secrets / vars expected in Cloudflare:
  *   GEMINI_API_KEYS   = key1,key2,key3               (SECRET)
@@ -443,7 +443,7 @@ function isPublicVisualUrl(raw) {
 }
 async function fetchVisualUrlAsBase64(rawUrl, maxBytes = 5 * 1024 * 1024) {
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.7.4' } });
+  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.8.0' } });
   if (!res.ok) throw new Error(`VISUAL_FETCH_HTTP_${res.status}`);
   const len = Number(res.headers.get('content-length') || 0);
   if (len && len > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
@@ -451,7 +451,7 @@ async function fetchVisualUrlAsBase64(rawUrl, maxBytes = 5 * 1024 * 1024) {
   if (!['image/png','image/jpeg','image/webp'].includes(mime)) throw new Error('VISUAL_URL_BAD_MIME');
   const buf = await res.arrayBuffer();
   if (buf.byteLength > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
-  return { mime, data: bytesToBase64Worker(new Uint8Array(buf)) };
+  return { mime, data: bytesToBase64Worker(new Uint8Array(buf)), sha256: await sha256HexWorker(buf), content_length: buf.byteLength, etag:res.headers.get('etag')||'', last_modified:res.headers.get('last-modified')||'' };
 }
 
 function bytesToHex(bytes) {
@@ -475,7 +475,7 @@ function validatorCanReuse(previous, meta) {
 async function fingerprintOneVisual(im, maxBytes = 8 * 1024 * 1024) {
   const rawUrl = String(im?.image_url || '');
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.7.4' };
+  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.8.0' };
   let meta = { etag:'', last_modified:'', content_length:0, mime:'' };
   try {
     const head = await fetch(rawUrl, { method:'HEAD', redirect:'follow', headers });
@@ -514,52 +514,181 @@ async function handleImageFingerprint(body) {
   return { data:{ algorithm:'sha256', visual_reader_revision:VISUAL_READER_REVISION, items } };
 }
 
+
+function base64ToBytesWorker(data) {
+  const bin = atob(String(data || '').replace(/\s/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+async function sha256TextWorker(text) {
+  return sha256HexWorker(new TextEncoder().encode(String(text || '')));
+}
+async function visualCacheSourceKey(sourceId) {
+  return `vc:s:${VISUAL_READER_REVISION}:${await sha256TextWorker(sourceId)}`;
+}
+function visualCacheHashKey(sha256) {
+  return `vc:h:${VISUAL_READER_REVISION}:${String(sha256 || '').toLowerCase()}`;
+}
+function visualCacheSafeRecord(record) {
+  return {
+    schema_version:'1.0',
+    visual_reader_revision:VISUAL_READER_REVISION,
+    source_id:String(record.source_id||''),
+    source_type:String(record.source_type||''),
+    label:clip(record.label||'',500),
+    image_url:clip(record.image_url||'',1600),
+    metadata:record.metadata&&typeof record.metadata==='object'?record.metadata:{},
+    sha256:String(record.sha256||''),
+    etag:String(record.etag||''),
+    last_modified:String(record.last_modified||''),
+    content_length:Number(record.content_length||0),
+    visual_type:String(record.visual_type||''),
+    title:clip(record.title||'',500),
+    complete_read:record.complete_read!==false,
+    unreadable_text:Array.isArray(record.unreadable_text)?record.unreadable_text.slice(0,30):[],
+    units:Array.isArray(record.units)?record.units.slice(0,100).map(u=>({
+      unit_id:clip(u.unit_id||'u',120),topic:clip(u.topic||'other',100),text:clip(u.text||'',6000),
+      bbox_norm:Array.isArray(u.bbox_norm)&&u.bbox_norm.length===4?u.bbox_norm:[0,0,1000,1000],
+      confidence:clip(u.confidence||'moderate',40)
+    })):[],
+    model:clip(record.model||'',120),
+    indexed_at:record.indexed_at||new Date().toISOString()
+  };
+}
+async function visualCachePut(env, asset, item, sha256, model='') {
+  if (!env.VISUAL_CACHE || !sha256 || !item || item.complete_read===false || !Array.isArray(item.units) || !item.units.length) return false;
+  if (!['HDSD_VISUAL','DUOC_THU_VISUAL'].includes(String(asset.source_type||''))) return false;
+  const record = visualCacheSafeRecord({
+    source_id:asset.source_id, source_type:asset.source_type, label:asset.label, image_url:asset.image_url,
+    metadata:asset.metadata||{}, sha256, etag:asset.etag||'', last_modified:asset.last_modified||'', content_length:asset.content_length||0, visual_type:item.visual_type||'', title:item.title||'',
+    complete_read:item.complete_read!==false, unreadable_text:item.unreadable_text||[], units:item.units||[], model
+  });
+  const value = JSON.stringify(record);
+  await Promise.all([
+    env.VISUAL_CACHE.put(await visualCacheSourceKey(asset.source_id), value),
+    env.VISUAL_CACHE.put(visualCacheHashKey(sha256), value)
+  ]);
+  return true;
+}
+function visualCacheOverlay(record, asset) {
+  if (!record) return null;
+  return {
+    ...record,
+    source_id:String(asset.source_id||record.source_id||''),
+    source_type:String(asset.source_type||record.source_type||''),
+    label:String(asset.label||record.label||''),
+    image_url:String(asset.image_url||record.image_url||''),
+    metadata:{...(record.metadata||{}),...(asset.metadata||{})}
+  };
+}
+async function visualCacheGetSource(env, asset) {
+  if (!env.VISUAL_CACHE || !asset?.source_id) return null;
+  const record = await env.VISUAL_CACHE.get(await visualCacheSourceKey(asset.source_id), 'json');
+  if (!record || record.visual_reader_revision !== VISUAL_READER_REVISION || record.complete_read===false) return null;
+  return visualCacheOverlay(record, asset);
+}
+async function visualCacheGetHash(env, asset, sha256) {
+  if (!env.VISUAL_CACHE || !sha256) return null;
+  const record = await env.VISUAL_CACHE.get(visualCacheHashKey(sha256), 'json');
+  if (!record || record.visual_reader_revision !== VISUAL_READER_REVISION || record.complete_read===false) return null;
+  const over = visualCacheOverlay(record, asset);
+  // Tạo alias theo source hiện tại để các lần sau chỉ cần 1 KV read.
+  try { await env.VISUAL_CACHE.put(await visualCacheSourceKey(asset.source_id), JSON.stringify(visualCacheSafeRecord(over))); } catch {}
+  return over;
+}
+async function handleVisualCacheResolve(body, env) {
+  const images = Array.isArray(body?.images) ? body.images.slice(0, 16) : [];
+  if (!env.VISUAL_CACHE) return { data:{ enabled:false, hits:[], misses:images.map(x=>({source_id:String(x?.source_id||''),reason:'KV_NOT_BOUND'})) } };
+  const hits=[],misses=[];
+  for (const raw of images) {
+    const asset={source_id:String(raw?.source_id||''),source_type:String(raw?.source_type||''),label:clip(raw?.label||'',500),image_url:String(raw?.image_url||''),metadata:raw?.metadata&&typeof raw.metadata==='object'?raw.metadata:{}};
+    if (!asset.source_id) continue;
+    try {
+      const sourceKey=await visualCacheSourceKey(asset.source_id);
+      let sourceRec=await env.VISUAL_CACHE.get(sourceKey,'json');
+      if(sourceRec&&sourceRec.visual_reader_revision!==VISUAL_READER_REVISION)sourceRec=null;
+      let sha=String(raw?.sha256||'').toLowerCase();
+
+      // Builder đã có SHA-256: không fetch lại ảnh. Runtime: xác nhận source alias bằng HTTP validator/SHA trước khi dùng.
+      if(sourceRec){
+        if(/^[a-f0-9]{64}$/.test(sha)){
+          if(sha===String(sourceRec.sha256||'').toLowerCase()){
+            hits.push({source_id:asset.source_id,sha256:sha,item:visualCacheOverlay(sourceRec,asset),via:'source+sha256'});continue;
+          }
+        }else if(asset.image_url){
+          const fp=await fingerprintOneVisual({...asset,previous:{sha256:sourceRec.sha256||'',etag:sourceRec.etag||'',last_modified:sourceRec.last_modified||'',content_length:sourceRec.content_length||0}});
+          if(fp?.ok)sha=String(fp.sha256||'').toLowerCase();
+          if(sha&&sha===String(sourceRec.sha256||'').toLowerCase()){
+            hits.push({source_id:asset.source_id,sha256:sha,item:visualCacheOverlay(sourceRec,asset),via:`source+${fp.unchanged_via||'sha256'}`});continue;
+          }
+        }
+      }
+
+      if(!/^[a-f0-9]{64}$/.test(sha)&&asset.image_url){
+        const fp=await fingerprintOneVisual(asset);if(fp?.ok)sha=String(fp.sha256||'').toLowerCase();
+      }
+      let rec=null;
+      if(/^[a-f0-9]{64}$/.test(sha))rec=await visualCacheGetHash(env,asset,sha);
+      if(rec)hits.push({source_id:asset.source_id,sha256:sha,item:rec,via:'sha256'});
+      else misses.push({source_id:asset.source_id,sha256:sha||'',reason:sourceRec?'CONTENT_CHANGED_OR_HASH_MISS':'CACHE_MISS'});
+    }catch(e){misses.push({source_id:asset.source_id,reason:String(e?.message||e)})}
+  }
+  return { data:{ enabled:true, visual_reader_revision:VISUAL_READER_REVISION, hits, misses } };
+}
+
 async function handleReadVisualEvidence(body, env) {
   const question = clip(body.question || '', 6000);
   const clinical = clip(body.clinical_context || '', 9000);
   const builderMode = body.builder_mode === true;
   const maxImages = builderMode ? 10 : 6;
   const images = Array.isArray(body.images) ? body.images.slice(0, maxImages) : [];
-  if (!images.length) return { data: { items: [] }, model: '', key_index: 0, usage: {}, attempts: 0 };
+  if (!images.length) return { data: { items: [] }, model: '', key_index: 0, usage: {}, attempts: 0, visual_cache:{enabled:!!env.VISUAL_CACHE,stored:0} };
+
   const userParts = [{ text: `CÂU HỎI HIỆN TẠI (chỉ để biết ngữ cảnh; vẫn phải đọc toàn bộ ảnh):\n${question}\n\nCLINICAL CONTEXT:\n${clinical || '(không có)'}\n\nSau đây là ${images.length} ảnh. Hãy đọc đầy đủ từng ảnh.` }];
+  const prepared = [];
   let totalBytes = 0;
   for (let i = 0; i < images.length; i++) {
     const im = images[i] || {};
     let mime = String(im.mime_type || '').toLowerCase();
     let data = String(im.data_base64 || '').replace(/\s/g, '');
+    let sha256 = String(im.sha256||'').toLowerCase(),etag=String(im.etag||''),last_modified=String(im.last_modified||''),content_length=Number(im.content_length||0);
     if (!data && im.image_url) {
       const fetched = await fetchVisualUrlAsBase64(im.image_url, 5 * 1024 * 1024);
-      mime = fetched.mime;
-      data = fetched.data;
+      mime = fetched.mime; data = fetched.data; sha256 = fetched.sha256 || '';etag=fetched.etag||'';last_modified=fetched.last_modified||'';content_length=fetched.content_length||0;
+    } else if (data && !/^[a-f0-9]{64}$/.test(sha256)) {
+      try { sha256 = await sha256HexWorker(base64ToBytesWorker(data)); } catch {}
     }
     if (!mime) mime = 'image/png';
     if (!['image/png','image/jpeg','image/webp'].includes(mime)) throw new Error('UNSUPPORTED_VISUAL_MIME');
     if (!data) throw new Error('VISUAL_DATA_REQUIRED');
     totalBytes += estimateBase64Bytes(data);
     if (totalBytes > 14 * 1024 * 1024) throw new Error('VISUAL_BATCH_TOO_LARGE');
+    prepared.push({asset:{source_id:String(im.source_id||''),source_type:String(im.source_type||''),label:String(im.label||''),image_url:String(im.image_url||''),metadata:im.metadata||{},etag,last_modified,content_length},sha256});
     userParts.push({ text: `ẢNH ${i + 1}\nsource_id: ${clip(im.source_id || '', 260)}\nsource_type: ${clip(im.source_type || '', 80)}\nlabel: ${clip(im.label || '', 500)}\nmetadata: ${clip(JSON.stringify(im.metadata || {}), 3500)}` });
     userParts.push({ inline_data: { mime_type: mime, data } });
   }
 
+  let out;
   if (builderMode) {
     const tier = String(body.model_tier || 'lite').toLowerCase();
     const models = tier === 'flash' ? ['gemini-3.5-flash'] : getBuilderModels(env);
     const requested = String(body.media_resolution || 'medium').toLowerCase();
     const mediaResolution = requested === 'high' ? 'MEDIA_RESOLUTION_HIGH' : requested === 'low' ? 'MEDIA_RESOLUTION_LOW' : 'MEDIA_RESOLUTION_MEDIUM';
-    return callGemini(env, {
-      system: VISUAL_EVIDENCE_SYSTEM,
-      prompt: '',
-      userParts,
-      temperature: 0.0,
-      maxOutputTokens: 9000,
-      jsonMode: true,
-      modelsOverride: models,
-      maxAttemptsOverride: 1,
-      mediaResolution
-    });
+    out = await callGemini(env, { system: VISUAL_EVIDENCE_SYSTEM, prompt: '', userParts, temperature: 0.0, maxOutputTokens: 9000, jsonMode: true, modelsOverride: models, maxAttemptsOverride: 1, mediaResolution });
+  } else {
+    out = await callGemini(env, { system: VISUAL_EVIDENCE_SYSTEM, prompt: '', userParts, temperature: 0.0, maxOutputTokens: 9000, jsonMode: true, modelsOverride:getBuilderModels(env), maxAttemptsOverride:1, mediaResolution:'MEDIA_RESOLUTION_MEDIUM' });
   }
 
-  return callGemini(env, { system: VISUAL_EVIDENCE_SYSTEM, prompt: '', userParts, temperature: 0.0, maxOutputTokens: 9000, jsonMode: true });
+  let stored=0;
+  if (body.cache_visual_results !== false && env.VISUAL_CACHE) {
+    for (const item of (out.data?.items || [])) {
+      const p=prepared.find(x=>x.asset.source_id===item.source_id);
+      if (!p?.sha256 || item.complete_read===false) continue;
+      try { if(await visualCachePut(env,p.asset,item,p.sha256,out.model||'')) stored++; } catch(e) { console.warn('VISUAL_CACHE_PUT_FAILED',e); }
+    }
+  }
+  return {...out, visual_cache:{enabled:!!env.VISUAL_CACHE,stored}};
 }
 
 const EVIDENCE_SELECTOR_SYSTEM = `Bạn là AI Evidence Selector của MedPlus AI Pro.
@@ -781,7 +910,7 @@ async function handlePubMedSearch(body, env) {
   params.set('retmax', String(retmax));
   params.set('usehistory', 'y');
   const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?${params}`;
-  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
+  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.0' } });
   if (!sres.ok) throw new Error(`NCBI_ESEARCH_HTTP_${sres.status}`);
   const sdata = await sres.json();
   const ids = sdata?.esearchresult?.idlist || [];
@@ -792,7 +921,7 @@ async function handlePubMedSearch(body, env) {
   fparams.set('id', ids.join(','));
   fparams.set('retmode', 'xml');
   const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fparams}`;
-  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
+  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.0' } });
   if (!fres.ok) throw new Error(`NCBI_EFETCH_HTTP_${fres.status}`);
   const xml = await fres.text();
   return { query, ids, xml };
@@ -811,7 +940,7 @@ async function handlePmcFullText(body, env) {
     email: String(env.NCBI_EMAIL || '')
   });
   const idUrl = `https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?${idp}`;
-  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
+  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.0' } });
   if (!ires.ok) throw new Error(`PMC_IDCONV_HTTP_${ires.status}`);
   const idData = await ires.json();
   const mapping = (idData.records || []).filter(r => r.pmcid && r.pmid).map(r => ({ pmid: String(r.pmid), pmcid: String(r.pmcid), doi: r.doi || '' }));
@@ -822,7 +951,7 @@ async function handlePmcFullText(body, env) {
   fp.set('id', mapping.map(x => x.pmcid).join(','));
   fp.set('retmode', 'xml');
   const url = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fp}`;
-  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.8.0' } });
   if (!res.ok) throw new Error(`PMC_EFETCH_HTTP_${res.status}`);
   return { mapping, xml: await res.text() };
 }
@@ -837,7 +966,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/api/health' && request.method === 'GET') {
-        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.7.4', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, max_text_calls_per_query: 2, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: Math.max(1, Math.min(6, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK || 2))), release_channel: 'stable' }, 200, headers);
+        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.8.0', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', max_text_calls_per_query: 2, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: Math.max(1, Math.min(6, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK || 2))), release_channel: 'stable' }, 200, headers);
       }
       if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, headers);
       const uploadRoute = url.pathname === '/api/ai/transcribe' || url.pathname === '/api/ai/extract-file' || url.pathname === '/api/ai/read-visual-evidence';
@@ -857,6 +986,10 @@ export default {
       }
       if (url.pathname === '/api/ai/image-fingerprint') {
         const out = await handleImageFingerprint(body);
+        return json({ ok: true, ...out }, 200, headers);
+      }
+      if (url.pathname === '/api/visual-cache/resolve') {
+        const out = await handleVisualCacheResolve(body, env);
         return json({ ok: true, ...out }, 200, headers);
       }
       if (url.pathname === '/api/ai/read-visual-evidence') {
