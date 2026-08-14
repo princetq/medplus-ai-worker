@@ -1,6 +1,6 @@
 /**
  * MedPlus AI Pro - Cloudflare Worker
- * Version: 0.8.1
+ * Version: 0.8.4
  *
  * Secrets / vars expected in Cloudflare:
  *   GEMINI_API_KEYS   = key1,key2,key3               (SECRET)
@@ -443,7 +443,7 @@ function isPublicVisualUrl(raw) {
 }
 async function fetchVisualUrlAsBase64(rawUrl, maxBytes = 5 * 1024 * 1024) {
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.8.1' } });
+  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.8.4' } });
   if (!res.ok) throw new Error(`VISUAL_FETCH_HTTP_${res.status}`);
   const len = Number(res.headers.get('content-length') || 0);
   if (len && len > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
@@ -475,7 +475,7 @@ function validatorCanReuse(previous, meta) {
 async function fingerprintOneVisual(im, maxBytes = 8 * 1024 * 1024) {
   const rawUrl = String(im?.image_url || '');
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.8.1' };
+  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.8.4' };
   let meta = { etag:'', last_modified:'', content_length:0, mime:'' };
   try {
     const head = await fetch(rawUrl, { method:'HEAD', redirect:'follow', headers });
@@ -771,6 +771,13 @@ async function handleAdjudicateCandidates(body, env){
   return callGemini(env,{system:CANDIDATE_ADJUDICATOR_SYSTEM,prompt,temperature:0,maxOutputTokens:3000,jsonMode:true});
 }
 
+function buildSynthesisSystem() {
+  return `Bạn là MedPlus AI Pro dành cho bác sĩ/dược sĩ. Trả lời tiếng Việt, trực tiếp và dựa trước hết vào evidence đã truy xuất.
+NGUỒN: PATIENT_FILE=dữ kiện bệnh nhân; CALCULATION=phép tính deterministic; HDSD_BV/HDSD_VISUAL=HDSD bệnh viện; DUOC_THU/DUOC_THU_VISUAL=Dược thư; GLOBAL_RESULT_SET=tập kết quả quét toàn kho; DOSE_DECISION=nhánh liều đã khớp nguồn; PUBMED/PMC chỉ bổ sung; MEDPLUS chủ yếu nhận diện sản phẩm.
+QUY TẮC: ưu tiên HDSD/Dược thư/visual. Nếu exhaustive, không tự rút gọn tập kết quả đã chứng minh; nếu completeness=false nêu giới hạn. Phân biệt entity thực sự thỏa predicate với đoạn chỉ nhắc tới entity khác. Tách tương kỵ pha/truyền khỏi chống chỉ định/tương tác lâm sàng. Với liều: ưu tiên DOSE_DECISION đúng drug_key; nếu chưa có chỉ chọn từ evidence đúng metric ClCr/eGFR/tuổi/cân nặng/Child-Pugh/RRT, không coi ClCr=eGFR nếu nguồn không cho phép. Nếu chưa có renal metric nhưng nguồn có liều thường phù hợp, nêu liều thường và giới hạn chưa hiệu chỉnh. AKI/CRRT/IHD/phù/sarcopenia/cụt chi/ICU làm giảm độ chắc chắn. Mọi item evidence phải citation source_id có thật, trực tiếp hỗ trợ, đúng drug_keys; ưu tiên visual citation khi dữ liệu nằm trong bảng. Không bịa PMID/source_id/liều/ngưỡng/ADR. Nếu nguồn xung đột, nêu xung đột. Thiếu dữ liệu vẫn trả phần có thể trả và nêu dữ liệu có thể đổi quyết định. AI_KNOWLEDGE chỉ để giải thích khi options cho phép, basis=ai_knowledge và không citation. Nếu continuation=true, đánh giá lại ca đã hợp nhất.
+JSON: {"title":"","bottom_line":"","clinical_confidence":{"level":"high|moderate|low","reason":""},"sections":[{"title":"","items":[{"text":"","basis":"evidence|ai_knowledge","source_ids":[],"drug_keys":[],"confidence":"high|moderate|low"}]}],"alerts":[{"text":"","source_ids":[],"drug_keys":[]}],"evidence_assessment":"","conflicts":[{"text":"","source_ids":[],"drug_keys":[]}],"limitations":"","need_more_data":[]}`;
+}
+
 const DOSE_MATCH_SYSTEM = `Bạn là Source-Constrained Dose Matcher của MedPlus AI Pro.
 NHIỆM VỤ: chọn đúng liều/nhánh liều cho từng thuốc CHỈ từ EVIDENCE được cung cấp và dữ kiện bệnh nhân. Đây là bước trích xuất + đối chiếu quy tắc, không phải tư vấn tự do.
 
@@ -928,7 +935,7 @@ async function handlePubMedSearch(body, env) {
   params.set('retmax', String(retmax));
   params.set('usehistory', 'y');
   const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?${params}`;
-  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.1' } });
+  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
   if (!sres.ok) throw new Error(`NCBI_ESEARCH_HTTP_${sres.status}`);
   const sdata = await sres.json();
   const ids = sdata?.esearchresult?.idlist || [];
@@ -939,7 +946,7 @@ async function handlePubMedSearch(body, env) {
   fparams.set('id', ids.join(','));
   fparams.set('retmode', 'xml');
   const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fparams}`;
-  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.1' } });
+  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
   if (!fres.ok) throw new Error(`NCBI_EFETCH_HTTP_${fres.status}`);
   const xml = await fres.text();
   return { query, ids, xml };
@@ -958,7 +965,7 @@ async function handlePmcFullText(body, env) {
     email: String(env.NCBI_EMAIL || '')
   });
   const idUrl = `https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?${idp}`;
-  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.1' } });
+  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
   if (!ires.ok) throw new Error(`PMC_IDCONV_HTTP_${ires.status}`);
   const idData = await ires.json();
   const mapping = (idData.records || []).filter(r => r.pmcid && r.pmid).map(r => ({ pmid: String(r.pmid), pmcid: String(r.pmcid), doi: r.doi || '' }));
@@ -969,7 +976,7 @@ async function handlePmcFullText(body, env) {
   fp.set('id', mapping.map(x => x.pmcid).join(','));
   fp.set('retmode', 'xml');
   const url = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fp}`;
-  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.8.1' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
   if (!res.ok) throw new Error(`PMC_EFETCH_HTTP_${res.status}`);
   return { mapping, xml: await res.text() };
 }
@@ -984,7 +991,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/api/health' && request.method === 'GET') {
-        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.8.1', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', max_text_calls_per_query: 2, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: Math.max(1, Math.min(6, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK || 2))), release_channel: 'stable' }, 200, headers);
+        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.8.4', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, synthesis_system_present: typeof buildSynthesisSystem === 'function', visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', max_text_calls_per_query: 2, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: Math.max(1, Math.min(6, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK || 2))), release_channel: 'stable' }, 200, headers);
       }
       if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, headers);
       const uploadRoute = url.pathname === '/api/ai/transcribe' || url.pathname === '/api/ai/extract-file' || url.pathname === '/api/ai/read-visual-evidence';
