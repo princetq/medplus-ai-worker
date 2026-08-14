@@ -1,6 +1,6 @@
 /**
  * MedPlus AI Pro - Cloudflare Worker
- * Version: 0.7.0
+ * Version: 0.7.2
  *
  * Secrets / vars expected in Cloudflare:
  *   GEMINI_API_KEYS   = key1,key2,key3               (SECRET)
@@ -24,6 +24,7 @@ const MAX_REQUEST_BYTES = 900_000;
 const MAX_EVIDENCE_ITEMS = 60;
 const MAX_EVIDENCE_CHARS = 120_000;
 const MAX_HISTORY_CHARS = 6_000;
+const VISUAL_READER_REVISION = 'v071-full-table-bbox-1';
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -427,7 +428,7 @@ function isPublicVisualUrl(raw) {
 }
 async function fetchVisualUrlAsBase64(rawUrl, maxBytes = 5 * 1024 * 1024) {
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.7' } });
+  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.7.2' } });
   if (!res.ok) throw new Error(`VISUAL_FETCH_HTTP_${res.status}`);
   const len = Number(res.headers.get('content-length') || 0);
   if (len && len > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
@@ -436,6 +437,66 @@ async function fetchVisualUrlAsBase64(rawUrl, maxBytes = 5 * 1024 * 1024) {
   const buf = await res.arrayBuffer();
   if (buf.byteLength > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
   return { mime, data: bytesToBase64Worker(new Uint8Array(buf)) };
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+async function sha256HexWorker(buf) {
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return bytesToHex(new Uint8Array(digest));
+}
+function normalizeHttpValidator(v) { return String(v || '').trim(); }
+function validatorCanReuse(previous, meta) {
+  if (!previous?.sha256) return '';
+  const pe = normalizeHttpValidator(previous.etag), e = normalizeHttpValidator(meta.etag);
+  // Strong or weak ETag equality is still useful here as a cache validator supplied by the origin.
+  if (pe && e && pe === e) return 'etag';
+  const pl = normalizeHttpValidator(previous.last_modified), l = normalizeHttpValidator(meta.last_modified);
+  const pn = Number(previous.content_length || 0), n = Number(meta.content_length || 0);
+  if (pl && l && pl === l && pn > 0 && n > 0 && pn === n) return 'last-modified+length';
+  return '';
+}
+async function fingerprintOneVisual(im, maxBytes = 8 * 1024 * 1024) {
+  const rawUrl = String(im?.image_url || '');
+  if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
+  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.7.2' };
+  let meta = { etag:'', last_modified:'', content_length:0, mime:'' };
+  try {
+    const head = await fetch(rawUrl, { method:'HEAD', redirect:'follow', headers });
+    if (head.ok) {
+      meta.etag = head.headers.get('etag') || '';
+      meta.last_modified = head.headers.get('last-modified') || '';
+      meta.content_length = Number(head.headers.get('content-length') || 0);
+      meta.mime = String(head.headers.get('content-type') || '').split(';')[0].toLowerCase();
+      const via = validatorCanReuse(im.previous || {}, meta);
+      if (via) return { source_id:String(im.source_id||''), ok:true, sha256:String(im.previous.sha256), ...meta, unchanged:true, unchanged_via:via, content_fetched:false };
+    }
+  } catch {}
+  const res = await fetch(rawUrl, { redirect:'follow', headers });
+  if (!res.ok) throw new Error(`VISUAL_FETCH_HTTP_${res.status}`);
+  const mime = String(res.headers.get('content-type') || meta.mime || '').split(';')[0].toLowerCase();
+  if (!['image/png','image/jpeg','image/webp'].includes(mime)) throw new Error('VISUAL_URL_BAD_MIME');
+  const len = Number(res.headers.get('content-length') || 0);
+  if (len && len > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
+  const buf = await res.arrayBuffer();
+  if (buf.byteLength > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
+  return {
+    source_id:String(im.source_id||''), ok:true, sha256:await sha256HexWorker(buf), mime,
+    content_length:buf.byteLength,
+    etag:res.headers.get('etag') || meta.etag || '',
+    last_modified:res.headers.get('last-modified') || meta.last_modified || '',
+    unchanged:false, unchanged_via:'sha256', content_fetched:true
+  };
+}
+async function handleImageFingerprint(body) {
+  const images = Array.isArray(body?.images) ? body.images.slice(0, 16) : [];
+  const items = [];
+  for (const im of images) {
+    try { items.push(await fingerprintOneVisual(im)); }
+    catch (e) { items.push({ source_id:String(im?.source_id||''), ok:false, error:String(e?.message||e) }); }
+  }
+  return { data:{ algorithm:'sha256', visual_reader_revision:VISUAL_READER_REVISION, items } };
 }
 
 async function handleReadVisualEvidence(body, env) {
@@ -733,7 +794,7 @@ async function handlePubMedSearch(body, env) {
   params.set('retmax', String(retmax));
   params.set('usehistory', 'y');
   const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?${params}`;
-  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7' } });
+  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
   if (!sres.ok) throw new Error(`NCBI_ESEARCH_HTTP_${sres.status}`);
   const sdata = await sres.json();
   const ids = sdata?.esearchresult?.idlist || [];
@@ -744,7 +805,7 @@ async function handlePubMedSearch(body, env) {
   fparams.set('id', ids.join(','));
   fparams.set('retmode', 'xml');
   const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fparams}`;
-  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7' } });
+  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
   if (!fres.ok) throw new Error(`NCBI_EFETCH_HTTP_${fres.status}`);
   const xml = await fres.text();
   return { query, ids, xml };
@@ -763,7 +824,7 @@ async function handlePmcFullText(body, env) {
     email: String(env.NCBI_EMAIL || '')
   });
   const idUrl = `https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?${idp}`;
-  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7' } });
+  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
   if (!ires.ok) throw new Error(`PMC_IDCONV_HTTP_${ires.status}`);
   const idData = await ires.json();
   const mapping = (idData.records || []).filter(r => r.pmcid && r.pmid).map(r => ({ pmid: String(r.pmid), pmcid: String(r.pmcid), doi: r.doi || '' }));
@@ -774,7 +835,7 @@ async function handlePmcFullText(body, env) {
   fp.set('id', mapping.map(x => x.pmcid).join(','));
   fp.set('retmode', 'xml');
   const url = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fp}`;
-  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.7' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
   if (!res.ok) throw new Error(`PMC_EFETCH_HTTP_${res.status}`);
   return { mapping, xml: await res.text() };
 }
@@ -789,7 +850,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/api/health' && request.method === 'GET') {
-        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.7.0', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true }, 200, headers);
+        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.7.2', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, release_channel: 'stable' }, 200, headers);
       }
       if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, headers);
       const uploadRoute = url.pathname === '/api/ai/transcribe' || url.pathname === '/api/ai/extract-file' || url.pathname === '/api/ai/read-visual-evidence';
@@ -805,6 +866,10 @@ export default {
       }
       if (url.pathname === '/api/ai/retrieval-director') {
         const out = await handleRetrievalDirector(body, env);
+        return json({ ok: true, ...out }, 200, headers);
+      }
+      if (url.pathname === '/api/ai/image-fingerprint') {
+        const out = await handleImageFingerprint(body);
         return json({ ok: true, ...out }, 200, headers);
       }
       if (url.pathname === '/api/ai/read-visual-evidence') {
