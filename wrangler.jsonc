@@ -5,5 +5,10 @@
   "keep_vars": true,
   "placement": {
     "region": "gcp:asia-southeast1"
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "VISUAL_CACHE"
+    }
+  ]
 }
