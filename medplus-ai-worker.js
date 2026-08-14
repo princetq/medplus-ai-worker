@@ -1,6 +1,6 @@
 /**
  * MedPlus AI Pro - Cloudflare Worker
- * Version: 0.8.4
+ * Version: 0.8.6
  *
  * Secrets / vars expected in Cloudflare:
  *   GEMINI_API_KEYS   = key1,key2,key3               (SECRET)
@@ -157,6 +157,7 @@ async function callGemini(env, { system, prompt, userParts = null, temperature =
           if (res.status === 429 && /prepayment credits are depleted|credit balance.*(?:0|depleted)|buy credits/i.test(message)) {
             const error = new Error('GEMINI_BILLING_PREPAY_DEPLETED');
             error.details = errors.slice(-12);
+            error.attempts = attempts;
             error.terminalGeminiRequest = true;
             throw error;
           }
@@ -165,6 +166,7 @@ async function callGemini(env, { system, prompt, userParts = null, temperature =
           if ([400,401,403].includes(res.status)) {
             const error = new Error('GEMINI_REQUEST_REJECTED');
             error.details = errors.slice(-12);
+            error.attempts = attempts;
             error.terminalGeminiRequest = true;
             throw error;
           }
@@ -192,6 +194,7 @@ async function callGemini(env, { system, prompt, userParts = null, temperature =
   }
   const error = new Error('ALL_GEMINI_FALLBACKS_FAILED');
   error.details = errors.slice(-12);
+  error.attempts = attempts;
   throw error;
 }
 
@@ -443,7 +446,7 @@ function isPublicVisualUrl(raw) {
 }
 async function fetchVisualUrlAsBase64(rawUrl, maxBytes = 5 * 1024 * 1024) {
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.8.4' } });
+  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.8.6' } });
   if (!res.ok) throw new Error(`VISUAL_FETCH_HTTP_${res.status}`);
   const len = Number(res.headers.get('content-length') || 0);
   if (len && len > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
@@ -475,7 +478,7 @@ function validatorCanReuse(previous, meta) {
 async function fingerprintOneVisual(im, maxBytes = 8 * 1024 * 1024) {
   const rawUrl = String(im?.image_url || '');
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.8.4' };
+  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.8.6' };
   let meta = { etag:'', last_modified:'', content_length:0, mime:'' };
   try {
     const head = await fetch(rawUrl, { method:'HEAD', redirect:'follow', headers });
@@ -743,32 +746,38 @@ Không trả lời câu hỏi y khoa.
 Ưu tiên MeSH + free-text hợp lý, không làm truy vấn quá hẹp. Khi câu hỏi hỏi bằng chứng mới/gần đây, có thể thêm khoảng năm nhưng không được bịa MeSH.
 Trả JSON với các trường: needs_pubmed (boolean), query (string), reason (string ngắn), focus_terms (array string), recent_focus (boolean).`;
 
-const CANDIDATE_ADJUDICATOR_SYSTEM = `Bạn là Exhaustive Group Adjudicator của MedPlus AI Pro. Đây là MỘT lượt phân loại duy nhất cho Free Tier; KHÔNG trả lời câu hỏi cuối.
+const CANDIDATE_ADJUDICATOR_SYSTEM = `Bạn là Exhaustive Group Adjudicator của MedPlus AI Pro. Đây là MỘT lượt phân loại duy nhất, ưu tiên tiết kiệm Free Tier. KHÔNG trả lời câu hỏi cuối.
 
-Nếu source_type=EXHAUSTIVE_GROUP_CANDIDATE, mỗi candidate là một NHÓM HOẠT CHẤT và đã kèm toàn bộ chế phẩm bệnh viện cùng group. Hãy quyết định GROUP có thực sự thỏa predicate của người dùng hay không.
+Mỗi candidate là một NHÓM HOẠT CHẤT bệnh viện. Candidate đã được local gate lọc theo predicate và chỉ chứa excerpt quanh bằng chứng liên quan nhất.
+
+PHÂN LOẠI:
+- SELECT: evidence cho thấy chính entity/group thỏa predicate.
+- REJECT: evidence cho thấy không thỏa, hoặc chỉ nhắc/so sánh/phối hợp với predicate.
+- UNCERTAIN: evidence chưa đủ để kết luận.
 
 QUY TẮC:
-- Phân loại ở cấp group, không chọn từng biệt dược.
-- Membership phải được chứng minh bởi evidence tự mô tả entity/group. Chỉ NHẮC, SO SÁNH, nói "khác với", "kém hơn", "tương tự", "phối hợp với" predicate/nhóm khác không chứng minh membership.
-- Nếu evidence của chính entity có self-classification trực tiếp mâu thuẫn predicate (ví dụ query yêu cầu mức/đời/thế hệ N nhưng source nói entity thuộc mức/đời/thế hệ khác), REJECT dù cùng đoạn có nhắc predicate để so sánh.
-- Với thuốc phối hợp, chỉ SELECT nếu evidence đủ để kết luận group/chế phẩm phù hợp cách người dùng hỏi; không suy diễn khi chưa đủ.
-- Chỉ dùng evidence được cung cấp; không tự thêm thuốc từ trí nhớ.
-- Mỗi candidate phải vào đúng một trong selected_ids / rejected_ids / uncertain_ids.
+- Không dùng trí nhớ để thêm thuốc ngoài candidates.
+- Self-classification trực tiếp thắng mention. Nếu source nói entity thuộc thế hệ/mức khác query thì REJECT.
+- Cụm kiểu "các cephalosporin thế hệ 3 khác" có thể là bằng chứng entity cùng nhóm nếu ngữ pháp rõ; còn "so với một số cephalosporin thế hệ 3" tự nó không đủ.
+- Với chế phẩm phối hợp, đánh giá group theo thành phần hoạt chất và evidence được cung cấp; nếu không đủ thì UNCERTAIN.
+- MỖI source_id đầu vào phải xuất hiện đúng một lần trong selected_ids, rejected_ids hoặc uncertain_ids.
 - Không tạo source_id mới.
 
-JSON: {"selected_ids":[],"rejected_ids":[],"uncertain_ids":[],"reason":""}`;
+JSON duy nhất:
+{"selected_ids":[],"rejected_ids":[],"uncertain_ids":[],"reason":""}`;
+
 async function handleAdjudicateCandidates(body, env){
   const question=clip(body.question||'',5000),plan=body.question_plan&&typeof body.question_plan==='object'?body.question_plan:{};
-  const candidates=Array.isArray(body.candidates)?body.candidates.slice(0,120).map(c=>({
+  const candidates=Array.isArray(body.candidates)?body.candidates.slice(0,32).map(c=>({
     source_id:clip(c.source_id||'',220),entity:clip(c.entity||'',220),label:clip(c.label||'',320),source_type:clip(c.source_type||'',80),
-    section:clip(c.section||'',180),drug_keys:Array.isArray(c.drug_keys)?c.drug_keys.slice(0,8):[],
+    drug_keys:Array.isArray(c.drug_keys)?c.drug_keys.slice(0,8):[],
     product_indices:Array.isArray(c.product_indices)?c.product_indices.slice(0,40):[],
-    support_source_ids:Array.isArray(c.support_source_ids)?c.support_source_ids.slice(0,8):[],
-    snippet:clip(c.snippet||'',3200)
+    support_source_ids:Array.isArray(c.support_source_ids)?c.support_source_ids.slice(0,6):[],
+    snippet:clip(c.snippet||'',4600)
   })):[];
-  if(!question||!candidates.length)return {data:{selected_ids:[],rejected_ids:[],uncertain_ids:[]},model:'',key_index:0,usage:{}};
-  const prompt=`QUESTION:\n${question}\n\nPLAN:\n${JSON.stringify({scope:plan.scope,answer_contract:plan.answer_contract,search_terms:plan.search_terms})}\n\nCANDIDATE GROUPS:\n${JSON.stringify(candidates)}`;
-  return callGemini(env,{system:CANDIDATE_ADJUDICATOR_SYSTEM,prompt,temperature:0,maxOutputTokens:3000,jsonMode:true});
+  if(!question||!candidates.length)return {data:{selected_ids:[],rejected_ids:[],uncertain_ids:[]},model:'',key_index:0,usage:{},attempts:0};
+  const prompt=`QUESTION:\n${question}\n\nMODE:\n${clip(plan.exhaustive_evidence_mode||'',60)}\n\nCANDIDATE GROUPS (${candidates.length}):\n${JSON.stringify(candidates)}`;
+  return callGemini(env,{system:CANDIDATE_ADJUDICATOR_SYSTEM,prompt,temperature:0,maxOutputTokens:2200,jsonMode:true,maxAttemptsOverride:1});
 }
 
 function buildSynthesisSystem() {
@@ -935,7 +944,7 @@ async function handlePubMedSearch(body, env) {
   params.set('retmax', String(retmax));
   params.set('usehistory', 'y');
   const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?${params}`;
-  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
+  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.6' } });
   if (!sres.ok) throw new Error(`NCBI_ESEARCH_HTTP_${sres.status}`);
   const sdata = await sres.json();
   const ids = sdata?.esearchresult?.idlist || [];
@@ -946,7 +955,7 @@ async function handlePubMedSearch(body, env) {
   fparams.set('id', ids.join(','));
   fparams.set('retmode', 'xml');
   const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fparams}`;
-  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
+  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.6' } });
   if (!fres.ok) throw new Error(`NCBI_EFETCH_HTTP_${fres.status}`);
   const xml = await fres.text();
   return { query, ids, xml };
@@ -965,7 +974,7 @@ async function handlePmcFullText(body, env) {
     email: String(env.NCBI_EMAIL || '')
   });
   const idUrl = `https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?${idp}`;
-  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
+  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.8.6' } });
   if (!ires.ok) throw new Error(`PMC_IDCONV_HTTP_${ires.status}`);
   const idData = await ires.json();
   const mapping = (idData.records || []).filter(r => r.pmcid && r.pmid).map(r => ({ pmid: String(r.pmid), pmcid: String(r.pmcid), doi: r.doi || '' }));
@@ -976,7 +985,7 @@ async function handlePmcFullText(body, env) {
   fp.set('id', mapping.map(x => x.pmcid).join(','));
   fp.set('retmode', 'xml');
   const url = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fp}`;
-  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.8.4' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.8.6' } });
   if (!res.ok) throw new Error(`PMC_EFETCH_HTTP_${res.status}`);
   return { mapping, xml: await res.text() };
 }
@@ -991,7 +1000,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/api/health' && request.method === 'GET') {
-        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.8.4', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, synthesis_system_present: typeof buildSynthesisSystem === 'function', visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', max_text_calls_per_query: 2, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: Math.max(1, Math.min(6, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK || 2))), release_channel: 'stable' }, 200, headers);
+        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.8.6', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, synthesis_system_present: typeof buildSynthesisSystem === 'function', visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', max_text_calls_per_query: 2, single_pass_candidate_adjudication: true, adjudication_max_candidates: 32, adjudication_single_model_attempt: true, adjudication_errors_report_attempts: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: Math.max(1, Math.min(6, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK || 2))), release_channel: 'stable' }, 200, headers);
       }
       if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, headers);
       const uploadRoute = url.pathname === '/api/ai/transcribe' || url.pathname === '/api/ai/extract-file' || url.pathname === '/api/ai/read-visual-evidence';
@@ -1063,7 +1072,8 @@ export default {
     } catch (err) {
       return json({
         error: String(err?.message || err),
-        details: err?.details || undefined
+        details: err?.details || undefined,
+        gemini_attempts: Number(err?.attempts || 0)
       }, 500, headers);
     }
   }
