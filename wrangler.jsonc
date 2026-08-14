@@ -1,10 +1,8 @@
 {
   "name": "aipro",
-  "main": "medplus-ai-worker-v0.4.0-cloudflare.js",
+  "main": "medplus-ai-worker-v0.7.0-cloudflare.js",
   "compatibility_date": "2026-08-14",
-
   "keep_vars": true,
-
   "placement": {
     "region": "gcp:asia-southeast1"
   }
