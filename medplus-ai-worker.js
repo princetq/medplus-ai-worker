@@ -1,6 +1,6 @@
 /**
  * MedPlus AI Pro - Cloudflare Worker
- * Version: 0.7.2
+ * Version: 0.7.4
  *
  * Secrets / vars expected in Cloudflare:
  *   GEMINI_API_KEYS   = key1,key2,key3               (SECRET)
@@ -21,9 +21,9 @@ const DEFAULT_MODELS = [
 ];
 
 const MAX_REQUEST_BYTES = 900_000;
-const MAX_EVIDENCE_ITEMS = 60;
-const MAX_EVIDENCE_CHARS = 120_000;
-const MAX_HISTORY_CHARS = 6_000;
+const MAX_EVIDENCE_ITEMS = 28;
+const MAX_EVIDENCE_CHARS = 46_000;
+const MAX_HISTORY_CHARS = 2_800;
 const VISUAL_READER_REVISION = 'v071-full-table-bbox-1';
 
 function json(data, status = 200, headers = {}) {
@@ -80,7 +80,7 @@ function normalizeEvidence(raw) {
     if (!item || !item.source_id || !item.text) continue;
     const remaining = MAX_EVIDENCE_CHARS - used;
     if (remaining <= 0) break;
-    const text = clip(item.text, Math.min(6000, remaining));
+    const text = clip(item.text, Math.min(3200, remaining));
     used += text.length;
     out.push({
       source_id: String(item.source_id),
@@ -103,24 +103,32 @@ function getModels(env) {
   return configured.length ? configured : DEFAULT_MODELS;
 }
 
+function getBuilderModels(env) {
+  const configured = csv(env.GEMINI_BUILDER_MODELS);
+  return configured.length ? configured : ['gemini-3.5-flash-lite'];
+}
+
 function extractGeminiText(data) {
   const parts = data?.candidates?.[0]?.content?.parts || [];
   return parts.map(p => p?.text || '').join('').trim();
 }
 
-async function callGemini(env, { system, prompt, userParts = null, temperature = 0.12, maxOutputTokens = 8192, jsonMode = true }) {
+async function callGemini(env, { system, prompt, userParts = null, temperature = 0.12, maxOutputTokens = 8192, jsonMode = true, modelsOverride = null, maxAttemptsOverride = null, mediaResolution = null }) {
   const keys = getKeys(env);
   if (!keys.length) throw new Error('GEMINI_KEY_NOT_CONFIGURED');
-  const models = getModels(env);
+  const models = Array.isArray(modelsOverride) && modelsOverride.length ? modelsOverride : getModels(env);
   const errors = [];
+  const maxAttempts = Math.max(1, Math.min(6, Number(maxAttemptsOverride ?? env.GEMINI_MAX_ATTEMPTS_PER_TASK ?? 2)));
+  let attempts = 0;
 
-  // User preference from the MedPlus project: exhaust all fallback models on key 1,
-  // then move to key 2, etc.
+  // Free-tier: vẫn fallback khi lỗi tạm thời nhưng giới hạn số model request thực tế cho mỗi task.
   for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
     const key = keys[keyIndex];
     for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
       const model = models[modelIndex];
       try {
+        if (attempts >= maxAttempts) { const e = new Error('GEMINI_FALLBACK_ATTEMPT_BUDGET_EXHAUSTED'); e.details = errors.slice(-12); throw e; }
+        attempts++;
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
         const payload = {
           system_instruction: { parts: [{ text: system }] },
@@ -128,6 +136,7 @@ async function callGemini(env, { system, prompt, userParts = null, temperature =
           generationConfig: {
             temperature,
             maxOutputTokens,
+            ...(mediaResolution ? { mediaResolution } : {}),
             ...(jsonMode ? { responseMimeType: 'application/json' } : {})
           }
         };
@@ -145,6 +154,12 @@ async function callGemini(env, { system, prompt, userParts = null, temperature =
         if (!res.ok) {
           const message = data?.error?.message || text.slice(0, 180);
           errors.push({ key: keyIndex + 1, model, status: res.status, message });
+          if (res.status === 429 && /prepayment credits are depleted|credit balance.*(?:0|depleted)|buy credits/i.test(message)) {
+            const error = new Error('GEMINI_BILLING_PREPAY_DEPLETED');
+            error.details = errors.slice(-12);
+            error.terminalGeminiRequest = true;
+            throw error;
+          }
           // 400/401/403 are usually request/auth/location errors and retrying every model/key only wastes quota.
           // 404 can be model-specific, while 408/429/5xx are transient/fallback-worthy.
           if ([400,401,403].includes(res.status)) {
@@ -168,7 +183,7 @@ async function callGemini(env, { system, prompt, userParts = null, temperature =
             parsed = JSON.parse(cleaned);
           }
         }
-        return { data: parsed, model, key_index: keyIndex + 1 };
+        return { data: parsed, model, key_index: keyIndex + 1, usage: data?.usageMetadata || {}, attempts };
       } catch (err) {
         if (err?.terminalGeminiRequest) throw err;
         errors.push({ key: keyIndex + 1, model, status: 0, message: String(err?.message || err) });
@@ -428,7 +443,7 @@ function isPublicVisualUrl(raw) {
 }
 async function fetchVisualUrlAsBase64(rawUrl, maxBytes = 5 * 1024 * 1024) {
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.7.2' } });
+  const res = await fetch(rawUrl, { redirect: 'follow', headers: { 'user-agent': 'MedPlusAIPro-Visual/0.7.4' } });
   if (!res.ok) throw new Error(`VISUAL_FETCH_HTTP_${res.status}`);
   const len = Number(res.headers.get('content-length') || 0);
   if (len && len > maxBytes) throw new Error('VISUAL_URL_TOO_LARGE');
@@ -460,7 +475,7 @@ function validatorCanReuse(previous, meta) {
 async function fingerprintOneVisual(im, maxBytes = 8 * 1024 * 1024) {
   const rawUrl = String(im?.image_url || '');
   if (!isPublicVisualUrl(rawUrl)) throw new Error('VISUAL_URL_NOT_ALLOWED');
-  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.7.2' };
+  const headers = { 'user-agent': 'MedPlusAIPro-Fingerprint/0.7.4' };
   let meta = { etag:'', last_modified:'', content_length:0, mime:'' };
   try {
     const head = await fetch(rawUrl, { method:'HEAD', redirect:'follow', headers });
@@ -502,8 +517,10 @@ async function handleImageFingerprint(body) {
 async function handleReadVisualEvidence(body, env) {
   const question = clip(body.question || '', 6000);
   const clinical = clip(body.clinical_context || '', 9000);
-  const images = Array.isArray(body.images) ? body.images.slice(0, 6) : [];
-  if (!images.length) return { data: { items: [] }, model: '', key_index: 0 };
+  const builderMode = body.builder_mode === true;
+  const maxImages = builderMode ? 10 : 6;
+  const images = Array.isArray(body.images) ? body.images.slice(0, maxImages) : [];
+  if (!images.length) return { data: { items: [] }, model: '', key_index: 0, usage: {}, attempts: 0 };
   const userParts = [{ text: `CÂU HỎI HIỆN TẠI (chỉ để biết ngữ cảnh; vẫn phải đọc toàn bộ ảnh):\n${question}\n\nCLINICAL CONTEXT:\n${clinical || '(không có)'}\n\nSau đây là ${images.length} ảnh. Hãy đọc đầy đủ từng ảnh.` }];
   let totalBytes = 0;
   for (let i = 0; i < images.length; i++) {
@@ -523,6 +540,25 @@ async function handleReadVisualEvidence(body, env) {
     userParts.push({ text: `ẢNH ${i + 1}\nsource_id: ${clip(im.source_id || '', 260)}\nsource_type: ${clip(im.source_type || '', 80)}\nlabel: ${clip(im.label || '', 500)}\nmetadata: ${clip(JSON.stringify(im.metadata || {}), 3500)}` });
     userParts.push({ inline_data: { mime_type: mime, data } });
   }
+
+  if (builderMode) {
+    const tier = String(body.model_tier || 'lite').toLowerCase();
+    const models = tier === 'flash' ? ['gemini-3.5-flash'] : getBuilderModels(env);
+    const requested = String(body.media_resolution || 'medium').toLowerCase();
+    const mediaResolution = requested === 'high' ? 'MEDIA_RESOLUTION_HIGH' : requested === 'low' ? 'MEDIA_RESOLUTION_LOW' : 'MEDIA_RESOLUTION_MEDIUM';
+    return callGemini(env, {
+      system: VISUAL_EVIDENCE_SYSTEM,
+      prompt: '',
+      userParts,
+      temperature: 0.0,
+      maxOutputTokens: 9000,
+      jsonMode: true,
+      modelsOverride: models,
+      maxAttemptsOverride: 1,
+      mediaResolution
+    });
+  }
+
   return callGemini(env, { system: VISUAL_EVIDENCE_SYSTEM, prompt: '', userParts, temperature: 0.0, maxOutputTokens: 9000, jsonMode: true });
 }
 
@@ -578,64 +614,15 @@ Không trả lời câu hỏi y khoa.
 Ưu tiên MeSH + free-text hợp lý, không làm truy vấn quá hẹp. Khi câu hỏi hỏi bằng chứng mới/gần đây, có thể thêm khoảng năm nhưng không được bịa MeSH.
 Trả JSON với các trường: needs_pubmed (boolean), query (string), reason (string ngắn), focus_terms (array string), recent_focus (boolean).`;
 
+const CANDIDATE_ADJUDICATOR_SYSTEM = `Bạn là Candidate Adjudicator của MedPlus AI Pro. Đây là một lượt phân xử duy nhất cho free tier; KHÔNG trả lời câu hỏi cuối. Với câu hỏi danh sách/tập hợp, quyết định ENTITY của candidate có thực sự thỏa predicate hay snippet chỉ đang nhắc/so sánh/phối hợp với predicate hoặc thuốc khác. Chỉ dùng snippet; không tự thêm thuốc. Nếu chưa đủ căn cứ, đưa vào uncertain_ids. Không tạo source_id mới. JSON: {"selected_ids":[],"rejected_ids":[],"uncertain_ids":[],"reason":""}`;
+async function handleAdjudicateCandidates(body, env){const question=clip(body.question||'',5000),plan=body.question_plan&&typeof body.question_plan==='object'?body.question_plan:{},candidates=Array.isArray(body.candidates)?body.candidates.slice(0,90).map(c=>({source_id:clip(c.source_id||'',220),entity:clip(c.entity||'',220),label:clip(c.label||'',320),source_type:clip(c.source_type||'',80),section:clip(c.section||'',180),drug_keys:Array.isArray(c.drug_keys)?c.drug_keys.slice(0,5):[],product_indices:Array.isArray(c.product_indices)?c.product_indices.slice(0,16):[],snippet:clip(c.snippet||'',520)})):[];if(!question||!candidates.length)return {data:{selected_ids:[],rejected_ids:[],uncertain_ids:[]},model:'',key_index:0,usage:{}};const prompt=`QUESTION:\n${question}\n\nPLAN:\n${JSON.stringify({scope:plan.scope,answer_contract:plan.answer_contract,search_terms:plan.search_terms})}\n\nCANDIDATES:\n${JSON.stringify(candidates)}`;return callGemini(env,{system:CANDIDATE_ADJUDICATOR_SYSTEM,prompt,temperature:0,maxOutputTokens:2600,jsonMode:true});}
+
 function buildSynthesisSystem() {
-  return `Bạn là MedPlus AI Pro, một Clinical Drug Intelligence Assistant dành cho bác sĩ/dược sĩ.
-MỤC TIÊU: trả lời trực tiếp câu hỏi sau khi AI Question Compiler, Global Evidence Graph, HDSD corpus, visual evidence, dữ kiện bệnh nhân và các bộ kiểm chứng đã hoàn tất retrieval. Không được biến top-k retrieval thành câu trả lời nếu QUESTION_PLAN/COMPLETENESS yêu cầu exhaustive. Citation là căn cứ kiểm chứng, KHÔNG phải câu trả lời thay cho phân tích.
-
-VAI TRÒ NGUỒN:
-0) PATIENT_FILE: dữ kiện người bệnh trích từ PDF/ảnh/Excel. Chỉ chứng minh dữ kiện bệnh nhân, không phải khuyến cáo y khoa.
-1) CALCULATION: phép tính deterministic của Clinical Calculator Engine (BSA, BMI, eGFR, CrCl, Child-Pugh...). Chỉ chứng minh giá trị dẫn xuất/phương pháp tính; KHÔNG được dùng CALCULATION đơn độc để tạo khuyến cáo liều.
-2) HDSD_BV + HDSD_VISUAL: thông tin cấp sản phẩm đang có tại bệnh viện. HDSD_VISUAL là bảng/hình đã được Gemini Vision đọc trực tiếp từ ảnh nguồn và phải được coi ngang hàng với phần chữ HDSD.
-3) DUOC_THU + DUOC_THU_VISUAL: Dược thư Quốc gia Việt Nam cấp hoạt chất/chuyên luận. DUOC_THU_VISUAL là bảng/hình gốc từ Dược thư đã được Vision đọc; đặc biệt quan trọng với bảng liều, ADR, hiệu chỉnh thận/gan.
-4) PUBMED/PMC: bằng chứng nghiên cứu quốc tế, chỉ BỔ SUNG sau khi dữ liệu nội bộ MedPlus/HDSD/Dược thư đã được khai thác.
-5) MEDPLUS: drug master/index (biệt dược, hoạt chất, hàm lượng, dạng bào chế, link); không mặc định là bằng chứng lâm sàng.
-6) CATALOG_SCAN: kết quả quét DETERMINISTIC toàn bộ danh mục bệnh viện, Dược thư classification index và HDSD. Khi câu hỏi hỏi "bệnh viện có những thuốc nào", đây là nguồn authoritative về DANH SÁCH; không được tự bỏ bớt hoặc thêm thuốc ngoài danh sách.
-7) DOSE_DECISION: kết quả Source-Constrained Dose Matcher đã ghép dữ kiện bệnh nhân (tuổi/cân nặng/ClCr/eGFR...) vào đúng nhánh liều có trong HDSD/Dược thư. Ưu tiên nguồn này khi có và luôn giữ citation nguồn gốc.
-8) GLOBAL_GRAPH / HDSD_CORPUS: bằng chứng/candidate đến từ quét toàn kho, dùng để bảo đảm không bỏ sót entity/section trước khi mở nguồn gốc.
-9) AI_KNOWLEDGE: kiến thức tổng hợp của mô hình, chỉ dùng để giải thích/kết nối khi cần; không gắn citation giả.
-
-CÁCH SUY LUẬN CA BỆNH:
-- Trước khi kết luận, tự phân rã vấn đề: chỉ định, liều, chức năng thận/gan, tuổi/cân nặng, tương tác thuốc-thuốc, tương tác thuốc-bệnh nhân, tương kỵ pha/truyền, độc tính cộng gộp, monitoring, dữ liệu còn thiếu.
-- Phân biệt rõ TƯƠNG KỴ VẬT LÝ/PHA TRUYỀN với CHỐNG CHỈ ĐỊNH hoặc TƯƠNG TÁC LÂM SÀNG. Tương kỵ pha chung không tự động có nghĩa hai thuốc không được dùng trên cùng bệnh nhân.
-- Với nhiều thuốc, đánh giá các cặp liên quan và nguy cơ cộng gộp (ví dụ độc thận/độc tai/QT/chảy máu) rồi mới tổng hợp.
-- Với định liều, nếu có DOSE_DECISION hợp lệ cho đúng thuốc thì phải dùng liều/nhánh đã được matcher chọn và giải thích metric nào đã được áp dụng. Nếu chưa có DOSE_DECISION, dùng giá trị từ CALCULATION để xác định bệnh nhân nằm ở nhánh/hàng nào của bảng hoặc quy tắc trong HDSD/DUOC_THU/PUBMED. Không suy ra liều chỉ từ eGFR/CrCl nếu evidence không chứa quy tắc liều phù hợp.
-- Nếu bệnh nhân đã cung cấp ClCr hoặc eGFR, không được trả một liều "chung chung" khi evidence có quy tắc hiệu chỉnh phù hợp: phải chọn đúng nhánh của giá trị đó. Nếu không có ClCr/eGFR nhưng đủ tuổi/cân nặng/chỉ định để nguồn cho liều thông thường, phải đưa ra liều thông thường phù hợp dữ kiện hiện có và nói rõ chưa áp dụng hiệu chỉnh thận.
-- Khi options.question_plan.must_be_exhaustive=true hoặc answer_contract=complete_list, phải phản ánh ĐẦY ĐỦ tập kết quả deterministic/global scan đã được cung cấp; không được rút gọn chỉ vì context dài.
-- Nếu options.completeness.complete=false, phải nói rõ giới hạn còn thiếu thay vì tuyên bố danh sách/đánh giá là đầy đủ.
-- Phương pháp tính được chính nguồn của thuốc dùng trong nghiên cứu/nhãn/bảng liều phải được ưu tiên hơn quy tắc chung. Nếu nguồn không nói rõ, trình bày bất định thay vì tự chọn một công thức với vẻ chắc chắn.
-- Nếu AKI/non-steady-state, phù/cổ trướng, sarcopenia, cụt chi, ICU/ARC, CRRT/IHD hoặc kiểu hình khác làm phép ước tính kém tin cậy, phải phản ánh điều đó trong khuyến nghị và confidence; không biến một con số ước tính thành “sự thật”.
-- Nếu thiếu dữ liệu, VẪN trả lời phần có thể trả lời và nói rõ điều gì chưa thể chốt; không trả kiểu “hãy xem tài liệu”.
-- Nếu options.continuation=true và câu hiện tại chủ yếu là BỔ SUNG DỮ KIỆN (ví dụ chỉ thêm creatinin, chiều cao, xét nghiệm, thuốc mới), KHÔNG chỉ xác nhận “đã nhận”. Hãy dùng hồ sơ ca bệnh đã hợp nhất + HISTORY để ĐÁNH GIÁ LẠI câu hỏi/quyết định lâm sàng trước đó và nêu rõ điều gì thay đổi sau dữ kiện mới.
-
-TRÍCH DẪN VÀ AN TOÀN:
-- Mọi item basis="evidence" phải có ít nhất một source_id có thật trong EVIDENCE và nội dung source phải trực tiếp hỗ trợ luận điểm.
-- ƯU TIÊN NGUỒN CỤC BỘ: nếu HDSD/Dược thư (kể cả bảng ảnh) đã trả lời trực tiếp thì phải dùng chúng làm trục chính. PubMed/PMC chỉ bổ sung, cập nhật hoặc giải quyết khoảng trống/xung đột.
-- Nếu một luận điểm về liều/ADR/ngưỡng nằm trong HDSD_VISUAL hoặc DUOC_THU_VISUAL, ưu tiên citation tới đúng visual evidence unit đó vì nó mang locator/bbox để giao diện focus đúng hàng/cell nguồn.
-- Mỗi item nói về một hay nhiều thuốc phải trả thêm drug_keys là mảng canonical key của các thuốc đang được nói tới (lấy từ metadata.drug_keys của evidence). Không gắn HDSD/Dược thư của thuốc A cho luận điểm về thuốc B. Với tương tác A+B, drug_keys phải chứa cả hai nếu luận điểm thực sự nói về cả hai.
-- PATIENT_FILE có thể citation cho dữ kiện ca bệnh; CALCULATION có thể citation cho phép tính; khuyến cáo y khoa phải được neo vào HDSD_BV/DUOC_THU/HDSD_VISUAL/DUOC_THU_VISUAL/PUBMED/PMC hoặc được ghi rõ basis="ai_knowledge" nếu chỉ là diễn giải tổng hợp.
-- Không tự tạo PMID/source_id. Chỉ dùng source_id đúng nguyên văn.
-- Không bịa liều, ngưỡng, công thức, tác dụng phụ, chống chỉ định hay monitoring.
-- Khi các nguồn khác nhau, trình bày khác biệt và giải thích; không hòa trộn thành đồng thuận giả.
-- Khi dữ kiện OCR/trích file không chắc, không dùng nó để chốt liều nếu sai số có thể đổi quyết định.
-- Confidence KHÔNG phải “mức tự tin của AI”. Nó phải phản ánh: độ đầy đủ dữ kiện bệnh nhân + độ tin cậy phép tính + mức phủ bằng chứng + mức đồng thuận nguồn + mức trực tiếp của nguồn với đúng quần thể/thuốc.
-- Trả lời tiếng Việt, ưu tiên kết luận thực hành: có/không/có điều kiện; liều/phương án nếu đủ căn cứ; cách dùng/tách đường truyền nếu liên quan; monitoring; điều kiện phải đánh giá lại.
-
-JSON BẮT BUỘC:
-{
-  "title": "tiêu đề ngắn",
-  "bottom_line": "kết luận trực tiếp cho chính ca bệnh",
-  "clinical_confidence": {"level":"high|moderate|low","reason":"lý do dựa trên dữ kiện + phép tính + bằng chứng"},
-  "sections": [
-    {"title":"...","items":[{"text":"...","basis":"evidence|ai_knowledge","source_ids":["ID"],"drug_keys":["canonical-active-key"],"confidence":"high|moderate|low"}]}
-  ],
-  "alerts": [{"text":"...","source_ids":["ID"],"drug_keys":["canonical-active-key"]}],
-  "evidence_assessment": "đánh giá nguồn/bằng chứng đã dùng",
-  "conflicts": [{"text":"...","source_ids":["ID1","ID2"],"drug_keys":["canonical-active-key"]}],
-  "limitations": "giới hạn hiện tại",
-  "need_more_data": ["dữ liệu bổ sung có thể làm thay đổi quyết định"]
-}`;
+  return `Bạn là MedPlus AI Pro dành cho bác sĩ/dược sĩ. Trả lời tiếng Việt, trực tiếp và dựa trước hết vào evidence đã truy xuất.
+NGUỒN: PATIENT_FILE=dữ kiện bệnh nhân; CALCULATION=phép tính deterministic; HDSD_BV/HDSD_VISUAL=HDSD bệnh viện; DUOC_THU/DUOC_THU_VISUAL=Dược thư; GLOBAL_RESULT_SET=tập kết quả quét toàn kho; DOSE_DECISION=nhánh liều đã khớp nguồn; PUBMED/PMC chỉ bổ sung; MEDPLUS chủ yếu nhận diện sản phẩm.
+QUY TẮC: ưu tiên HDSD/Dược thư/visual. Nếu exhaustive, không tự rút gọn tập kết quả đã chứng minh; nếu completeness=false nêu giới hạn. Phân biệt entity thực sự thỏa predicate với đoạn chỉ nhắc tới entity khác. Tách tương kỵ pha/truyền khỏi chống chỉ định/tương tác lâm sàng. Với liều: ưu tiên DOSE_DECISION đúng drug_key; nếu chưa có chỉ chọn từ evidence đúng metric ClCr/eGFR/tuổi/cân nặng/Child-Pugh/RRT, không coi ClCr=eGFR nếu nguồn không cho phép. Nếu chưa có renal metric nhưng nguồn có liều thường phù hợp, nêu liều thường và giới hạn chưa hiệu chỉnh. AKI/CRRT/IHD/phù/sarcopenia/cụt chi/ICU làm giảm độ chắc chắn. Mọi item evidence phải citation source_id có thật, trực tiếp hỗ trợ, đúng drug_keys; ưu tiên visual citation khi dữ liệu nằm trong bảng. Không bịa PMID/source_id/liều/ngưỡng/ADR. Nếu nguồn xung đột, nêu xung đột. Thiếu dữ liệu vẫn trả phần có thể trả và nêu dữ liệu có thể đổi quyết định. AI_KNOWLEDGE chỉ để giải thích khi options cho phép, basis=ai_knowledge và không citation. Nếu continuation=true, đánh giá lại ca đã hợp nhất.
+JSON: {"title":"","bottom_line":"","clinical_confidence":{"level":"high|moderate|low","reason":""},"sections":[{"title":"","items":[{"text":"","basis":"evidence|ai_knowledge","source_ids":[],"drug_keys":[],"confidence":"high|moderate|low"}]}],"alerts":[{"text":"","source_ids":[],"drug_keys":[]}],"evidence_assessment":"","conflicts":[{"text":"","source_ids":[],"drug_keys":[]}],"limitations":"","need_more_data":[]}`;
 }
-
 
 const DOSE_MATCH_SYSTEM = `Bạn là Source-Constrained Dose Matcher của MedPlus AI Pro.
 NHIỆM VỤ: chọn đúng liều/nhánh liều cho từng thuốc CHỈ từ EVIDENCE được cung cấp và dữ kiện bệnh nhân. Đây là bước trích xuất + đối chiếu quy tắc, không phải tư vấn tự do.
@@ -699,7 +686,7 @@ async function handleSynthesize(body, env) {
   const evidence = normalizeEvidence(body.evidence);
   const history = clip(body.history || '', MAX_HISTORY_CHARS);
   const options = body.options && typeof body.options === 'object' ? body.options : {};
-  const patientContext = clip(body.patient_context || '', 14000);
+  const patientContext = clip(body.patient_context || '', 9000);
   const evidenceText = evidence.map((e, i) => [
     `SOURCE ${i + 1}`,
     `source_id: ${e.source_id}`,
@@ -713,7 +700,7 @@ async function handleSynthesize(body, env) {
     ? 'KHÔNG sử dụng kiến thức AI bổ sung; không tạo item basis=ai_knowledge. Nếu evidence không đủ, chỉ nêu giới hạn.'
     : 'Có thể dùng kiến thức AI bổ sung để giải thích khi hữu ích, nhưng phải basis=ai_knowledge và không có citation.';
   const prompt = `NGÀY HỆ THỐNG: ${new Date().toISOString().slice(0, 10)}\n\nCÂU HỎI HIỆN TẠI:\n${question}\n\nCLINICAL CONTEXT (gồm dữ kiện file + parser + phép tính deterministic nếu client gửi):\n${patientContext || '(không có)'}\n\nNGỮ CẢNH HỘI THOẠI GẦN NHẤT (chỉ để hiểu câu hỏi nối tiếp, không phải nguồn bằng chứng):\n${history || '(không có)'}\n\nTÙY CHỌN:\n${JSON.stringify(options)}\n\nQUY TẮC KIẾN THỨC AI CHO LƯỢT NÀY:\n${aiKnowledgeRule}\n\nEVIDENCE (chỉ các source_id dưới đây mới hợp lệ):\n${evidenceText || '(không có nguồn cục bộ/PubMed phù hợp)'}\n\nHãy tự kiểm tra consistency trước khi xuất JSON cuối.`;
-  return callGemini(env, { system: buildSynthesisSystem(), prompt, temperature: 0.10, maxOutputTokens: 8192, jsonMode: true });
+  return callGemini(env, { system: buildSynthesisSystem(), prompt, temperature: 0.10, maxOutputTokens: 4800, jsonMode: true });
 }
 
 
@@ -794,7 +781,7 @@ async function handlePubMedSearch(body, env) {
   params.set('retmax', String(retmax));
   params.set('usehistory', 'y');
   const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?${params}`;
-  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
+  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
   if (!sres.ok) throw new Error(`NCBI_ESEARCH_HTTP_${sres.status}`);
   const sdata = await sres.json();
   const ids = sdata?.esearchresult?.idlist || [];
@@ -805,7 +792,7 @@ async function handlePubMedSearch(body, env) {
   fparams.set('id', ids.join(','));
   fparams.set('retmode', 'xml');
   const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fparams}`;
-  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
+  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
   if (!fres.ok) throw new Error(`NCBI_EFETCH_HTTP_${fres.status}`);
   const xml = await fres.text();
   return { query, ids, xml };
@@ -824,7 +811,7 @@ async function handlePmcFullText(body, env) {
     email: String(env.NCBI_EMAIL || '')
   });
   const idUrl = `https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?${idp}`;
-  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
+  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
   if (!ires.ok) throw new Error(`PMC_IDCONV_HTTP_${ires.status}`);
   const idData = await ires.json();
   const mapping = (idData.records || []).filter(r => r.pmcid && r.pmid).map(r => ({ pmid: String(r.pmid), pmcid: String(r.pmcid), doi: r.doi || '' }));
@@ -835,7 +822,7 @@ async function handlePmcFullText(body, env) {
   fp.set('id', mapping.map(x => x.pmcid).join(','));
   fp.set('retmode', 'xml');
   const url = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fp}`;
-  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.7.2' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/0.7.4' } });
   if (!res.ok) throw new Error(`PMC_EFETCH_HTTP_${res.status}`);
   return { mapping, xml: await res.text() };
 }
@@ -850,7 +837,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/api/health' && request.method === 'GET') {
-        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.7.2', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, release_channel: 'stable' }, 200, headers);
+        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '0.7.4', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, max_text_calls_per_query: 2, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: Math.max(1, Math.min(6, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK || 2))), release_channel: 'stable' }, 200, headers);
       }
       if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, headers);
       const uploadRoute = url.pathname === '/api/ai/transcribe' || url.pathname === '/api/ai/extract-file' || url.pathname === '/api/ai/read-visual-evidence';
@@ -874,6 +861,10 @@ export default {
       }
       if (url.pathname === '/api/ai/read-visual-evidence') {
         const out = await handleReadVisualEvidence(body, env);
+        return json({ ok: true, ...out }, 200, headers);
+      }
+      if (url.pathname === '/api/ai/adjudicate-candidates') {
+        const out = await handleAdjudicateCandidates(body, env);
         return json({ ok: true, ...out }, 200, headers);
       }
       if (url.pathname === '/api/ai/select-evidence') {
