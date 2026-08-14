@@ -1,4 +1,4 @@
-/**
+/**.
  * MedPlus AI Pro - Cloudflare Worker
  * Version: 0.7.2
  *
