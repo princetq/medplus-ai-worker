@@ -1,6 +1,6 @@
 /**
  * MedPlus AI Pro - Cloudflare Worker
- * Version: 1.5.5
+ * Version: 1.5.7
  *
  * Secrets / vars expected in Cloudflare:
  *   GEMINI_API_KEYS   = key1,key2,key3               (SECRET)
@@ -208,7 +208,7 @@ QUY TẮC:
 - Chỉ lấy dữ kiện xuất hiện trong câu hỏi, PATIENT_CONTEXT hoặc PRIOR_CASE_JSON. Không tự điền giá trị bình thường/ước đoán.
 - Nếu chỉ có năm sinh (ví dụ "sinh năm 2014"), đặt birth_year=2014 và age_years=null; không tự chọn ngày/tháng sinh.
 - Phân biệt thuốc đang dùng (current), bác sĩ dự định thêm (planned), đã ngừng (stopped) nếu câu nói thể hiện rõ.
-- Giữ nguyên liều, tần suất và đường dùng quan trọng. Có thể chuẩn hóa đơn vị hiển nhiên (µmol/L -> umol/L), nhưng KHÔNG tạo giá trị dẫn xuất.
+- Giữ nguyên liều, tần suất, đường dùng và thời điểm bắt đầu/ngừng thuốc nếu người dùng cung cấp. Đây là dữ kiện quan trọng cho đánh giá quan hệ thời gian ADR. Có thể chuẩn hóa đơn vị hiển nhiên (µmol/L -> umol/L), nhưng KHÔNG tạo giá trị dẫn xuất.
 - Nếu người dùng/hồ sơ cung cấp trực tiếp ClCr/creatinine clearance, ghi vào renal.reported_crcl; nếu cung cấp eGFR, ghi vào renal.reported_egfr. Không tự tính một chỉ số này từ chỉ số kia trong Parser.
 - Nếu cùng một dữ kiện có nhiều giá trị theo thời gian, ghi vào trend/labs với thời điểm nếu có.
 - Nếu một dữ kiện từ file có confidence thấp/moderate, giữ mức không chắc chắn trong uncertainty; không nâng confidence.
@@ -252,7 +252,7 @@ JSON BẮT BUỘC:
     "encephalopathy_grade": "none|grade1_2|grade3_4|unknown"
   },
   "diagnoses": [],
-  "medications": [{"name":"","dose":"","frequency":"","route":"","status":"current|planned|stopped|unknown"}],
+  "medications": [{"name":"","dose":"","frequency":"","route":"","status":"current|planned|stopped|unknown","start_time":"","stop_time":""}],
   "allergies": [],
   "labs": [{"name":"","value":"","unit":"","time":"","confidence":"high|moderate|low"}],
   "tasks": [{"key":"dose|interaction|compatibility|renal|hepatic|monitoring|indication|toxicity|other","question":""}],
@@ -908,6 +908,17 @@ LIỀU:
 - Nếu chưa đủ metric để chọn nhánh cá thể hóa nhưng nguồn có liều thông thường, có thể nêu liều thông thường và nói rõ chưa hiệu chỉnh.
 - AKI/non-steady-state, CRRT/IHD, phù, sarcopenia, cụt chi, ICU làm giảm độ chắc chắn.
 
+TARGET DRUG LOCK & ADR CAUSALITY:
+- Nếu options.question_plan.target_drug_lock=true, target_drug_keys/target_drug_labels là thuốc ĐÍCH của câu hỏi. Các thuốc khác trong ca chỉ là context, không được chiếm retrieval/citation hoặc PubMed của câu hỏi đích.
+- Với ADR/độc tính: luôn kiểm quan hệ thời gian drug start → bất thường xuất hiện → drug stop/dechallenge. Nếu bất thường đã tồn tại trước khi bắt đầu thuốc, thuốc đó không thể giải thích SỰ KHỞI PHÁT; chỉ có thể được cân nhắc là yếu tố làm nặng sau đó nếu xu hướng hỗ trợ.
+- Phân biệt causality của bất thường hiện tại với nguy cơ ADR nếu tiếp tục điều trị.
+
+EVIDENCE FLOOR:
+- Nếu HDSD/Dược thư/PubMed/PMC phù hợp đã có trong EVIDENCE, các claim về tần suất, tỷ lệ, thời gian khởi phát, yếu tố nguy cơ, ngưỡng nồng độ, monitoring và xử trí PHẢI basis=evidence và cite đúng source_id.
+- Không được viết phần chính của câu trả lời bằng AI_KNOWLEDGE khi đã có nguồn trực tiếp cho thuốc đích.
+- AI_KNOWLEDGE chỉ được dùng để nối lập luận hoặc giải thích cơ chế khi nguồn chưa đủ; KHÔNG được đưa con số %, ngưỡng, số ngày/tuần, odds ratio, Cmin hay tần suất dưới basis=ai_knowledge.
+- Nếu PubMed mode=always nhưng PubMed audit không có bài phù hợp, nói rõ giới hạn retrieval; không tự bịa số liệu nghiên cứu để lấp chỗ trống.
+
 CITATION & AN TOÀN:
 - Item basis=evidence chỉ được dùng source_id có thật và trực tiếp hỗ trợ claim.
 - Không bịa PMID/source_id.
@@ -922,7 +933,7 @@ CHẤT LƯỢNG TRÌNH BÀY KIỂU NGHIÊN CỨU SÂU:
 - Mỗi section phải trả lời một câu hỏi con rõ ràng. Ưu tiên 2–5 section, chỉ nhiều hơn khi ca thực sự phức tạp.
 - Một item nên là một ý hoàn chỉnh, có diễn giải ý nghĩa lâm sàng; tránh câu cụt kiểu trích xuất database.
 - Không gắn chữ high/moderate/low vào nội dung câu chỉ để trang trí; confidence đã có engine riêng ở client.
-- Khi PubMed/PMC có mặt, phân biệt rõ dữ liệu nội bộ với bằng chứng nghiên cứu bổ sung; chỉ nêu loại nghiên cứu/đặc điểm nghiên cứu nếu metadata/source thực sự hỗ trợ.
+- Khi PubMed/PMC có mặt, phải dùng chúng cho các câu hỏi về tần suất/yếu tố nguy cơ/onset/xử trí nếu trực tiếp hỗ trợ; phân biệt rõ dữ liệu nội bộ với bằng chứng nghiên cứu bổ sung; chỉ nêu loại nghiên cứu/đặc điểm nghiên cứu nếu metadata/source thực sự hỗ trợ.
 - Không phóng đại bằng chứng. Nếu nguồn chỉ là HDSD/Dược thư, không gọi đó là "nghiên cứu".
 - Không dùng các câu boilerplate như "cần theo dõi sát" nếu không nói rõ theo dõi gì và vì sao.
 - Không lặp toàn bộ dữ kiện bệnh nhân đã có trong Clinical Box; chỉ nhắc dữ kiện nào làm thay đổi lập luận.
@@ -1105,21 +1116,21 @@ async function handlePubMedSearch(body, env) {
   params.set('retmax', String(retmax));
   params.set('usehistory', 'y');
   const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?${params}`;
-  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.5' } });
+  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.7' } });
   if (!sres.ok) throw new Error(`NCBI_ESEARCH_HTTP_${sres.status}`);
   const sdata = await sres.json();
-  const ids = sdata?.esearchresult?.idlist || [];
-  if (!ids.length) return { query, ids: [], xml: '' };
+  const es = sdata?.esearchresult || {}, ids = es.idlist || [], count = Number(es.count || 0), queryTranslation = es.querytranslation || '', warninglist = es.warninglist || null;
+  if (!ids.length) return { query, ids: [], count, query_translation: queryTranslation, warninglist, xml: '' };
 
   const fparams = ncbiBaseParams(env);
   fparams.set('db', 'pubmed');
   fparams.set('id', ids.join(','));
   fparams.set('retmode', 'xml');
   const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fparams}`;
-  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.5' } });
+  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.7' } });
   if (!fres.ok) throw new Error(`NCBI_EFETCH_HTTP_${fres.status}`);
   const xml = await fres.text();
-  return { query, ids, xml };
+  return { query, ids, count, query_translation: queryTranslation, warninglist, xml };
 }
 
 async function handlePmcFullText(body, env) {
@@ -1135,7 +1146,7 @@ async function handlePmcFullText(body, env) {
     email: String(env.NCBI_EMAIL || '')
   });
   const idUrl = `https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?${idp}`;
-  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.5' } });
+  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.7' } });
   if (!ires.ok) throw new Error(`PMC_IDCONV_HTTP_${ires.status}`);
   const idData = await ires.json();
   const mapping = (idData.records || []).filter(r => r.pmcid && r.pmid).map(r => ({ pmid: String(r.pmid), pmcid: String(r.pmcid), doi: r.doi || '' }));
@@ -1146,7 +1157,7 @@ async function handlePmcFullText(body, env) {
   fp.set('id', mapping.map(x => x.pmcid).join(','));
   fp.set('retmode', 'xml');
   const url = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fp}`;
-  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/1.5.5' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/1.5.7' } });
   if (!res.ok) throw new Error(`PMC_EFETCH_HTTP_${res.status}`);
   return { mapping, xml: await res.text() };
 }
@@ -1161,7 +1172,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/api/health' && request.method === 'GET') {
-        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '1.5.5', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, local_source_engine: true, atomic_legacy_baseline: true, shared_catalog_fingerprint_v2: true, verified_fact_hash_migration: true, manifest_bound_group_identity: true, baseline_ai_queue_guard: true, legacy_representation_delta_suppression: true, legacy_group_migration_guard: true, legacy_identity_resolver: true, baseline_content_compare: true, lazy_visual_on_demand: true, visual_prebuild_optional: true, query_scoped_visual_coverage: true, baseline_readiness_hotfix: true, legacy_baseline_zero_ai: true, research_grade_synthesis: true, builder_readiness_contract: true, incremental_ai_data_builder: true, semantic_source_builder: true, source_hash_gatekeeper: true, derived_data_manifest: true, data_lifecycle_runtime_reconcile: true, contextual_confidence_engine: true, responsive_compact_ui: true, pubmed_explicit_always: true, pubmed_ncbi_esearch_efetch: true, pmc_deep_read_pipeline: true, question_domain_gate: true, domain_guard_post_verifier: true, domain_scoped_missing_data: true, clinical_pharmacy_reasoning_engine: true, best_available_answer_policy: true, always_answer_with_available_data: true, auto_ai_knowledge_gap_fallback: true, clinical_coverage_contract: true, deterministic_missing_data_recommender: true, internal_fact_reader: true, fact_reader_models: getModels(env), model_key_fallback_order: 'all models key1 -> all models key2 -> ...', synthesis_system_present: typeof buildSynthesisSystem === 'function', visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', adaptive_ai_budget: true, text_task_soft_target: 2, text_task_safety_ceiling: 12, vision_task_soft_target: 1, vision_task_safety_ceiling: 3, hard_two_call_cap_removed: true, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: env.GEMINI_MAX_ATTEMPTS_PER_TASK ? Math.max(1, Math.min(24, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK))) : 'auto_all_model_key_combinations', release_channel: 'stable' }, 200, headers);
+        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '1.5.7', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, local_source_engine: true, target_drug_lock: true, adr_temporal_causality_contract: true, evidence_floor: true, clickable_citation_contract: true, pubmed_query_ladder: true, pubmed_esearch_audit: true, bootstrap_priority_gate: true, bootstrap_static_source_preserve: true, atomic_legacy_baseline: true, shared_catalog_fingerprint_v2: true, verified_fact_hash_migration: true, manifest_bound_group_identity: true, baseline_ai_queue_guard: true, legacy_representation_delta_suppression: true, legacy_group_migration_guard: true, legacy_identity_resolver: true, baseline_content_compare: true, lazy_visual_on_demand: true, visual_prebuild_optional: true, query_scoped_visual_coverage: true, baseline_readiness_hotfix: true, legacy_baseline_zero_ai: true, research_grade_synthesis: true, builder_readiness_contract: true, incremental_ai_data_builder: true, semantic_source_builder: true, source_hash_gatekeeper: true, derived_data_manifest: true, data_lifecycle_runtime_reconcile: true, contextual_confidence_engine: true, responsive_compact_ui: true, pubmed_explicit_always: true, pubmed_ncbi_esearch_efetch: true, pmc_deep_read_pipeline: true, question_domain_gate: true, domain_guard_post_verifier: true, domain_scoped_missing_data: true, clinical_pharmacy_reasoning_engine: true, best_available_answer_policy: true, always_answer_with_available_data: true, auto_ai_knowledge_gap_fallback: true, clinical_coverage_contract: true, deterministic_missing_data_recommender: true, internal_fact_reader: true, fact_reader_models: getModels(env), model_key_fallback_order: 'all models key1 -> all models key2 -> ...', synthesis_system_present: typeof buildSynthesisSystem === 'function', visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', adaptive_ai_budget: true, text_task_soft_target: 2, text_task_safety_ceiling: 12, vision_task_soft_target: 1, vision_task_safety_ceiling: 3, hard_two_call_cap_removed: true, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: env.GEMINI_MAX_ATTEMPTS_PER_TASK ? Math.max(1, Math.min(24, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK))) : 'auto_all_model_key_combinations', release_channel: 'stable' }, 200, headers);
       }
       if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, headers);
       const uploadRoute = url.pathname === '/api/ai/transcribe' || url.pathname === '/api/ai/extract-file' || url.pathname === '/api/ai/read-visual-evidence';
