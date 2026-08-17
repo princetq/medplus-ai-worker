@@ -1,6 +1,6 @@
 /**
  * MedPlus AI Pro - Cloudflare Worker
- * Version: 1.2.0
+ * Version: 1.5.0
  *
  * Secrets / vars expected in Cloudflare:
  *   GEMINI_API_KEYS   = key1,key2,key3               (SECRET)
@@ -773,6 +773,81 @@ async function handleAdjudicateCandidates(body, env){
 }
 
 
+
+const INCREMENTAL_SOURCE_BUILDER_SYSTEM = `Bạn là Incremental Internal Source Builder của MedPlus AI Pro.
+NHIỆM VỤ: chỉ đọc SOURCE_PACKAGE của MỘT active group và đề xuất dữ liệu ngữ nghĩa dẫn xuất cho group đó.
+
+MỤC TIÊU:
+1. Xác định Dược thư candidate nào thực sự tương ứng với hoạt chất/group nếu nguồn hỗ trợ.
+2. Trích xuất VERIFIED FACT candidate chỉ cho:
+   - predicate="drug_class"
+   - predicate="generation" (chỉ khi nguồn nói rõ thế hệ và class liên quan)
+3. Ghi class mentions để hỗ trợ recall, nhưng mention KHÔNG phải verified fact.
+
+QUY TẮC CỨNG:
+- Không dùng trí nhớ để bổ sung class/thế hệ.
+- Chỉ dựa trên source_id/source_hash/text được gửi.
+- Một fact verified_candidate phải là DIRECT SELF-STATEMENT về chính hoạt chất hoặc thành phần của group, không phải câu so sánh, phối hợp, đề kháng, hay chỉ nhắc tên nhóm khác.
+- excerpt phải là đoạn NGẮN trích từ đúng source text; không diễn đạt lại.
+- source_id và source_hash phải copy chính xác từ SOURCE_PACKAGE.
+- drug_class.value dùng canonical English key ngắn, chữ thường, snake_case nếu cần.
+- class_aliases chỉ gồm từ/cụm từ thực sự xuất hiện trong excerpt/source và canonical key.
+- generation.value là số 1..5; qualifier.class phải khớp drug_class nếu có.
+- Nếu không đủ bằng chứng: uncertain. Không cố điền.
+- Dược thư match chỉ verified_candidate khi title/alias/nội dung thực sự nói về hoạt chất/group; nếu candidate chỉ gần tên thì uncertain.
+- Với thuốc phối hợp, có thể có nhiều drug_class fact nếu từng thành phần được nguồn tự mô tả rõ.
+- Không tạo dữ liệu liều, ADR, tương tác... thành verified_facts ở schema này. Những nội dung đó nằm trong Global Graph/source sections deterministic.
+
+JSON BẮT BUỘC:
+{
+  "group_key":"",
+  "duoc_match":{"status":"verified_candidate|uncertain|none","duoc_ids":[],"reason":"","source_ids":[]},
+  "facts":[{
+    "predicate":"drug_class|generation","value":"","qualifier":{},
+    "status":"verified_candidate|uncertain","method":"ai_semantic_direct_statement",
+    "source_id":"","source_hash":"","excerpt":"","class_aliases":[],"reason":""
+  }],
+  "mentions":[{"class_key":"","aliases":[],"source_ids":[]}],
+  "notes":[]
+}`;
+
+async function handleBuildSourceGroup(body, env) {
+  const group = body?.group && typeof body.group === 'object' ? body.group : {};
+  const sources = Array.isArray(body?.sources) ? body.sources.slice(0, 28).map(s => ({
+    source_id: clip(s?.source_id || '', 260),
+    source_hash: clip(s?.source_hash || '', 128),
+    source_type: clip(s?.source_type || '', 80),
+    title: clip(s?.title || '', 280),
+    section: clip(s?.section || '', 220),
+    duoc_id: clip(s?.duoc_id || '', 220),
+    active: clip(s?.active || '', 260),
+    text: clip(s?.text || '', 4200)
+  })).filter(s => s.source_id && s.source_hash && s.text) : [];
+  const duocCandidates = Array.isArray(body?.duoc_candidates) ? body.duoc_candidates.slice(0, 8).map(x => ({
+    id: clip(x?.id || '', 220),
+    title: clip(x?.title || '', 260),
+    aliases: Array.isArray(x?.aliases) ? x.aliases.slice(0, 16).map(v => clip(v, 180)) : [],
+    source_ids: Array.isArray(x?.source_ids) ? x.source_ids.slice(0, 12) : []
+  })) : [];
+  if (!group?.key || !sources.length) {
+    return { data:{group_key:group?.key||'',duoc_match:{status:'none',duoc_ids:[],reason:'NO_SOURCE',source_ids:[]},facts:[],mentions:[],notes:['NO_SOURCE']}, model:'', key_index:0, usage:{}, attempts:0 };
+  }
+  const prompt = `GROUP:\n${JSON.stringify({
+    key: clip(group.key,220),
+    active_labels: Array.isArray(group.active_labels)?group.active_labels.slice(0,12):[],
+    brands: Array.isArray(group.brands)?group.brands.slice(0,24):[],
+    existing_duoc_ids: Array.isArray(group.existing_duoc_ids)?group.existing_duoc_ids.slice(0,8):[],
+    existing_facts: Array.isArray(group.existing_facts)?group.existing_facts.slice(0,20):[]
+  })}\n\nDUOC_CANDIDATES:\n${JSON.stringify(duocCandidates)}\n\nSOURCE_PACKAGE:\n${JSON.stringify(sources)}`;
+  return callGemini(env, {
+    system: INCREMENTAL_SOURCE_BUILDER_SYSTEM,
+    prompt,
+    temperature: 0,
+    maxOutputTokens: 4200,
+    jsonMode: true
+  });
+}
+
 const SOURCE_FACT_READER_SYSTEM = `Bạn là Internal Source Reader của MedPlus AI Pro.
 NHIỆM VỤ DUY NHẤT: đọc SOURCE_TEXT được cung cấp và xác định mỗi group có thỏa PREDICATE hay không. Không trả lời câu hỏi cuối, không dùng trí nhớ để thêm thuốc.
 - select: chính hoạt chất/group được nguồn mô tả là thỏa predicate.
@@ -804,7 +879,7 @@ THỨ TỰ NGUỒN:
 
 QUESTION DOMAIN GATE:
 - options.question_domain/domain_policy là ranh giới bắt buộc cho lượt này.
-- INVENTORY: không yêu cầu ClCr/eGFR/creatinin/cân nặng/tuổi/xét nghiệm; không tạo need_more_data; không dùng AI_KNOWLEDGE để điền danh mục bệnh viện.
+- INVENTORY: không yêu cầu ClCr/eGFR/creatinin/cân nặng/tuổi/xét nghiệm; không tạo need_more_data; không dùng AI_KNOWLEDGE để điền danh mục bệnh viện. Nếu có PUBMED/PMC, chỉ dùng để giải thích/phân loại/bối cảnh nghiên cứu; TUYỆT ĐỐI không thêm, xóa hay đổi product_count/active_count của catalog bệnh viện.
 - DRUG_KNOWLEDGE / SPECIAL_POPULATION / ADMINISTRATION / INTERACTION_COMPATIBILITY khi không patient-specific: trả lời kiến thức chung, KHÔNG biến thành ca bệnh và KHÔNG yêu cầu dữ kiện bệnh nhân.
 - Chỉ PATIENT_CASE / REGIMEN_REVIEW / PATIENT_SPECIFIC_DOSE có patient_specific=true mới được khuyến cáo bổ sung dữ kiện bệnh nhân, và chỉ dữ kiện có thể đổi quyết định hiện tại.
 - Không tự mở node lâm sàng ngoài options.clinical_contract.
@@ -840,10 +915,30 @@ CITATION & AN TOÀN:
 - AI_KNOWLEDGE không citation.
 - Không để confidence cao nếu phần quan trọng dựa chủ yếu vào AI_KNOWLEDGE hoặc dữ kiện còn thiếu.
 
-CẤU TRÚC:
-- bottom_line phải trả lời trực tiếp điều người dùng hỏi.
-- sections chỉ tạo các mục thực sự hữu ích cho câu hỏi.
-- need_more_data là khuyến cáo bổ sung, KHÔNG thay thế câu trả lời.
+CHẤT LƯỢNG TRÌNH BÀY KIỂU NGHIÊN CỨU SÂU:
+- Viết như một dược sĩ lâm sàng đang tổng hợp bằng chứng cho đồng nghiệp, không như log của phần mềm.
+- Mở bằng kết luận 2–4 câu: trả lời trực tiếp, nêu điều kiện quan trọng nhất nếu có.
+- Sau đó XÂU CHUỖI bằng chứng thành lập luận; không lần lượt kể lại từng đoạn nguồn và không lặp cùng một ý ở nhiều mục.
+- Mỗi section phải trả lời một câu hỏi con rõ ràng. Ưu tiên 2–5 section, chỉ nhiều hơn khi ca thực sự phức tạp.
+- Một item nên là một ý hoàn chỉnh, có diễn giải ý nghĩa lâm sàng; tránh câu cụt kiểu trích xuất database.
+- Không gắn chữ high/moderate/low vào nội dung câu chỉ để trang trí; confidence đã có engine riêng ở client.
+- Khi PubMed/PMC có mặt, phân biệt rõ dữ liệu nội bộ với bằng chứng nghiên cứu bổ sung; chỉ nêu loại nghiên cứu/đặc điểm nghiên cứu nếu metadata/source thực sự hỗ trợ.
+- Không phóng đại bằng chứng. Nếu nguồn chỉ là HDSD/Dược thư, không gọi đó là "nghiên cứu".
+- Không dùng các câu boilerplate như "cần theo dõi sát" nếu không nói rõ theo dõi gì và vì sao.
+- Không lặp toàn bộ dữ kiện bệnh nhân đã có trong Clinical Box; chỉ nhắc dữ kiện nào làm thay đổi lập luận.
+- Nếu câu hỏi inventory: kết luận bằng số lượng + danh sách xác minh; không thêm tư vấn xét nghiệm hay đoạn giáo khoa không được hỏi.
+- Nếu câu hỏi knowledge/special population: cấu trúc ưu tiên Kết luận → Điều chỉnh/điểm cần lưu ý → Theo dõi → Bằng chứng/giới hạn.
+- Nếu interaction/incompatibility: tách "dùng cùng trong điều trị" và "pha/truyền chung" khi liên quan.
+- Nếu patient case/regimen/dose: cấu trúc ưu tiên Kết luận → Cơ sở quyết định → Khuyến nghị thực hành → Monitoring → Điều kiện có thể đổi quyết định.
+
+CẤU TRÚC JSON:
+- title: ngắn, chuyên nghiệp, tối đa khoảng 12 từ; không lặp nguyên câu hỏi.
+- bottom_line: 2–4 câu trả lời trực tiếp; không đặt citation text trong đây.
+- sections: chỉ các mục thực sự hữu ích và không trùng ý.
+- alerts: chỉ dành cho điều có thể gây hại hoặc thay đổi quyết định; không dùng như mục "lưu ý" chung.
+- evidence_assessment: tóm tắt chất lượng/phạm vi nguồn, không kể lại nội dung.
+- limitations: chỉ nêu giới hạn thật sự ảnh hưởng độ chắc chắn.
+- need_more_data: chỉ dùng khi domain cho phép và dữ kiện có khả năng đổi quyết định.
 
 JSON:
 {"title":"","bottom_line":"","clinical_confidence":{"level":"high|moderate|low","reason":""},"sections":[{"title":"","items":[{"text":"","basis":"evidence|ai_knowledge","source_ids":[],"drug_keys":[],"confidence":"high|moderate|low"}]}],"alerts":[{"text":"","source_ids":[],"drug_keys":[]}],"evidence_assessment":"","conflicts":[{"text":"","source_ids":[],"drug_keys":[]}],"limitations":"","need_more_data":[]}`;
@@ -929,7 +1024,7 @@ async function handleSynthesize(body, env) {
     ? `DOMAIN ${domain.key||'general'}: need_more_data PHẢI là []; không yêu cầu xét nghiệm/ClCr/eGFR/creatinin/cân nặng/tuổi hay dữ kiện bệnh nhân.`
     : `DOMAIN ${domain.key||'clinical'}: chỉ đề nghị dữ kiện thuộc allowed_missing_keys=${JSON.stringify(domain.allowed_missing_keys||[])} và có thể đổi quyết định hiện tại.`;
   const prompt = `NGÀY HỆ THỐNG: ${new Date().toISOString().slice(0, 10)}\n\nCÂU HỎI HIỆN TẠI:\n${question}\n\nCLINICAL CONTEXT (gồm dữ kiện file + parser + phép tính deterministic nếu client gửi):\n${patientContext || '(không có)'}\n\nNGỮ CẢNH HỘI THOẠI GẦN NHẤT (chỉ để hiểu câu hỏi nối tiếp, không phải nguồn bằng chứng):\n${history || '(không có)'}\n\nTÙY CHỌN:\n${JSON.stringify(options)}\n\nQUESTION DOMAIN RULE:\n${domainRule}\n\nQUY TẮC KIẾN THỨC AI CHO LƯỢT NÀY:\n${aiKnowledgeRule}\n\nEVIDENCE (chỉ các source_id dưới đây mới hợp lệ):\n${evidenceText || '(không có nguồn cục bộ/PubMed phù hợp)'}\n\nYÊU CẦU CUỐI: trả lời câu hỏi chính ngay cả khi dữ kiện chưa hoàn chỉnh. Không được biến need_more_data thành câu trả lời chính. Hãy tự kiểm tra consistency, drug scope, số/liều/metric và phân biệt evidence với AI_KNOWLEDGE trước khi xuất JSON cuối.`;
-  return callGemini(env, { system: buildSynthesisSystem(), prompt, temperature: 0.08, maxOutputTokens: 5600, jsonMode: true });
+  return callGemini(env, { system: buildSynthesisSystem(), prompt, temperature: 0.08, maxOutputTokens: 6800, jsonMode: true });
 }
 
 
@@ -1010,7 +1105,7 @@ async function handlePubMedSearch(body, env) {
   params.set('retmax', String(retmax));
   params.set('usehistory', 'y');
   const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?${params}`;
-  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.2.0' } });
+  const sres = await fetch(searchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.0' } });
   if (!sres.ok) throw new Error(`NCBI_ESEARCH_HTTP_${sres.status}`);
   const sdata = await sres.json();
   const ids = sdata?.esearchresult?.idlist || [];
@@ -1021,7 +1116,7 @@ async function handlePubMedSearch(body, env) {
   fparams.set('id', ids.join(','));
   fparams.set('retmode', 'xml');
   const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fparams}`;
-  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.2.0' } });
+  const fres = await fetch(fetchUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.0' } });
   if (!fres.ok) throw new Error(`NCBI_EFETCH_HTTP_${fres.status}`);
   const xml = await fres.text();
   return { query, ids, xml };
@@ -1040,7 +1135,7 @@ async function handlePmcFullText(body, env) {
     email: String(env.NCBI_EMAIL || '')
   });
   const idUrl = `https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/?${idp}`;
-  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.2.0' } });
+  const ires = await fetch(idUrl, { headers: { 'user-agent': 'MedPlusAIPro/1.5.0' } });
   if (!ires.ok) throw new Error(`PMC_IDCONV_HTTP_${ires.status}`);
   const idData = await ires.json();
   const mapping = (idData.records || []).filter(r => r.pmcid && r.pmid).map(r => ({ pmid: String(r.pmid), pmcid: String(r.pmcid), doi: r.doi || '' }));
@@ -1051,7 +1146,7 @@ async function handlePmcFullText(body, env) {
   fp.set('id', mapping.map(x => x.pmcid).join(','));
   fp.set('retmode', 'xml');
   const url = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?${fp}`;
-  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/1.2.0' } });
+  const res = await fetch(url, { headers: { 'user-agent': 'MedPlusAIPro/1.5.0' } });
   if (!res.ok) throw new Error(`PMC_EFETCH_HTTP_${res.status}`);
   return { mapping, xml: await res.text() };
 }
@@ -1066,7 +1161,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === '/api/health' && request.method === 'GET') {
-        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '1.2.0', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, local_source_engine: true, question_domain_gate: true, domain_guard_post_verifier: true, domain_scoped_missing_data: true, clinical_pharmacy_reasoning_engine: true, best_available_answer_policy: true, always_answer_with_available_data: true, auto_ai_knowledge_gap_fallback: true, clinical_coverage_contract: true, deterministic_missing_data_recommender: true, internal_fact_reader: true, fact_reader_models: getModels(env), model_key_fallback_order: 'all models key1 -> all models key2 -> ...', synthesis_system_present: typeof buildSynthesisSystem === 'function', visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', adaptive_ai_budget: true, text_task_soft_target: 2, text_task_safety_ceiling: 12, vision_task_soft_target: 1, vision_task_safety_ceiling: 3, hard_two_call_cap_removed: true, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: env.GEMINI_MAX_ATTEMPTS_PER_TASK ? Math.max(1, Math.min(24, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK))) : 'auto_all_model_key_combinations', release_channel: 'stable' }, 200, headers);
+        return json({ ok: true, service: 'MedPlus AI Pro', platform: 'Cloudflare Workers', version: '1.5.0', gemini_models: getModels(env), gemini_key_count: getKeys(env).length, ncbi_key: !!env.NCBI_API_KEY, case_state_merge: true, full_catalog_scan: true, source_constrained_dose_matcher: true, citation_drug_scope: true, ai_retrieval_director: true, visual_table_reader: true, visual_unit_citations: true, citation_focus_locator: true, local_sources_first: true, ai_question_compiler: true, global_evidence_graph: true, iterative_completeness: true, persistent_hdsd_corpus: true, precomputed_visual_index_support: true, case_context_compiler: true, legacy_catalog_rules_removed: true, hdsd_first_image_skip: true, incremental_visual_fingerprint: true, visual_fingerprint_sha256: true, visual_reader_revision: VISUAL_READER_REVISION, stable_filenames: true, free_tier_optimized: true, builder_free_tier_optimized: true, builder_primary_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', builder_max_images_per_call: 10, builder_single_model_attempt: true, builder_default_media_resolution: 'medium', builder_retry_media_resolution: 'high', prepay_terminal_stop: true, visual_cache_kv_enabled: !!env.VISUAL_CACHE, server_visual_cache: true, visual_cache_self_learning: true, builder_optional: true, local_source_engine: true, research_grade_synthesis: true, builder_readiness_contract: true, incremental_ai_data_builder: true, semantic_source_builder: true, source_hash_gatekeeper: true, derived_data_manifest: true, data_lifecycle_runtime_reconcile: true, contextual_confidence_engine: true, responsive_compact_ui: true, pubmed_explicit_always: true, pubmed_ncbi_esearch_efetch: true, pmc_deep_read_pipeline: true, question_domain_gate: true, domain_guard_post_verifier: true, domain_scoped_missing_data: true, clinical_pharmacy_reasoning_engine: true, best_available_answer_policy: true, always_answer_with_available_data: true, auto_ai_knowledge_gap_fallback: true, clinical_coverage_contract: true, deterministic_missing_data_recommender: true, internal_fact_reader: true, fact_reader_models: getModels(env), model_key_fallback_order: 'all models key1 -> all models key2 -> ...', synthesis_system_present: typeof buildSynthesisSystem === 'function', visual_cache_storage: 'Cloudflare Workers KV', runtime_visual_cache_model: getBuilderModels(env)[0] || 'gemini-3.5-flash-lite', adaptive_ai_budget: true, text_task_soft_target: 2, text_task_safety_ceiling: 12, vision_task_soft_target: 1, vision_task_safety_ceiling: 3, hard_two_call_cap_removed: true, single_pass_candidate_adjudication: true, local_query_compiler: true, local_completeness_audit: true, gemini_usage_metadata: true, max_gemini_attempts_per_task: env.GEMINI_MAX_ATTEMPTS_PER_TASK ? Math.max(1, Math.min(24, Number(env.GEMINI_MAX_ATTEMPTS_PER_TASK))) : 'auto_all_model_key_combinations', release_channel: 'stable' }, 200, headers);
       }
       if (request.method !== 'POST') return json({ error: 'METHOD_NOT_ALLOWED' }, 405, headers);
       const uploadRoute = url.pathname === '/api/ai/transcribe' || url.pathname === '/api/ai/extract-file' || url.pathname === '/api/ai/read-visual-evidence';
@@ -1094,6 +1189,10 @@ export default {
       }
       if (url.pathname === '/api/ai/read-visual-evidence') {
         const out = await handleReadVisualEvidence(body, env);
+        return json({ ok: true, ...out }, 200, headers);
+      }
+      if (url.pathname === '/api/ai/build-source-group') {
+        const out = await handleBuildSourceGroup(body, env);
         return json({ ok: true, ...out }, 200, headers);
       }
       if (url.pathname === '/api/ai/extract-source-facts') {
